@@ -35,6 +35,14 @@ interface LogPerExercise {
   exercise: Exercise
   sets: SetEntry[]
 }
+/** 紀錄頁的群組單位：對應 menu 的 position
+ *  - lanes.length === 1 → 單一動作 (依序 set 1, 2, 3...)
+ *  - lanes.length >= 2 → superset (依 round 交錯：A1→B1, A2→B2)
+ */
+interface LogGroup {
+  position: number
+  lanes: LogPerExercise[]
+}
 
 interface StatRow {
   exercise_name: string
@@ -62,7 +70,7 @@ interface Me { id: number; username: string; role: string }
 // state
 // =========================================================================
 const me = ref<Me | null>(null)
-const tab = ref<'menus' | 'log' | 'stats'>('menus')
+const tab = ref<'menus' | 'log' | 'stats' | 'feed'>('menus')
 
 const menus = ref<MenuSummary[]>([])
 const menuDetail = ref<MenuDetail | null>(null)
@@ -91,14 +99,94 @@ const draft = ref<Draft>({
   exercises: [{ name: '', position: 1, slot: 1, target_sets: '', target_reps: '', notes: '' }],
 })
 
-// 紀錄表單
-const logMenuId = ref<number | null>(null)
-const logRows = ref<LogPerExercise[]>([])
-const logNotes = ref('')
+// =========================================================================
+// 紀錄狀態 (新版：逐 set 存檔、resume in-progress)
+// =========================================================================
+interface InProgressSet {
+  id: number
+  exerciseId: number
+  exerciseName: string
+  setNumber: number
+  weightKg: number | null
+  reps: number | null
+}
+
+const logId = ref<number | null>(null)                  // 目前 in-progress log
+const logMenuLoaded = ref<MenuDetail | null>(null)      // 該 log 的菜單詳細 (有 groups)
+const logSets = ref<InProgressSet[]>([])                // 該 log 已存的所有 set
+const currentPosition = ref(1)                          // 使用者目前停在哪個 position
+const activeLaneIdx = ref(0)                            // group 內哪一個 lane (動作) 是 active
+const activeField = ref<'weight' | 'reps'>('weight')    // keypad 寫到哪個 tile
+const inputW = ref('')                                  // weight 輸入緩衝
+const inputR = ref('')                                  // reps 輸入緩衝
+const logNotes = ref('')                                // 整次訓練備註
+
+const currentGroup = computed(() => {
+  return logMenuLoaded.value?.groups.find(g => g.position === currentPosition.value) || null
+})
+const currentLane = computed(() => {
+  return currentGroup.value?.exercises[activeLaneIdx.value] || null
+})
+const positionsCount = computed(() => logMenuLoaded.value?.groups.length || 0)
+const positions = computed(() => logMenuLoaded.value?.groups.map(g => g.position).sort((a, b) => a - b) || [])
+const currentPositionIdx = computed(() => positions.value.indexOf(currentPosition.value))
+const hasNextPosition = computed(() => currentPositionIdx.value >= 0 && currentPositionIdx.value < positions.value.length - 1)
+const hasPrevPosition = computed(() => currentPositionIdx.value > 0)
+
+const setsForCurrentLane = computed(() => {
+  if (!currentLane.value) return []
+  return logSets.value
+    .filter(s => s.exerciseId === currentLane.value!.id)
+    .sort((a, b) => a.setNumber - b.setNumber)
+})
+const totalVolumeForLane = computed(() => {
+  return setsForCurrentLane.value.reduce((sum, s) =>
+    sum + (Number(s.weightKg) || 0) * (s.reps || 0), 0,
+  )
+})
 
 // 統計
 const stats = ref<StatRow[]>([])
 const myLogs = ref<MyLogRow[]>([])
+
+// feed (訓練留言板)
+interface FeedRow {
+  id: number
+  user_id: number
+  username: string
+  display_name: string | null
+  menu_id: number | null
+  menu_name: string | null
+  notes: string
+  performed_at: string
+  completed_at: string
+  set_count: number
+  total_volume: string | null
+  exercise_count: number
+}
+const feed = ref<FeedRow[]>([])
+
+async function loadFeed() {
+  loading.value = true
+  errorMsg.value = ''
+  try {
+    const r = await fetch('/api/fitness/feed', { credentials: 'include' })
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    const d = await r.json()
+    feed.value = d.feed
+  } catch (e: any) { errorMsg.value = e?.message || '載入失敗' }
+  finally { loading.value = false }
+}
+
+function relTime(iso: string): string {
+  const sec = (Date.now() - new Date(iso).getTime()) / 1000
+  if (sec < 60) return '剛剛'
+  if (sec < 3600) return `${Math.floor(sec / 60)} 分鐘前`
+  if (sec < 86400) return `${Math.floor(sec / 3600)} 小時前`
+  if (sec < 86400 * 7) return `${Math.floor(sec / 86400)} 天前`
+  const d = new Date(iso)
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`
+}
 
 // =========================================================================
 // helpers
@@ -153,6 +241,17 @@ function addSlot(position: number) {
     name: '', position, slot: lastSlot + 1, target_sets: '', target_reps: '', notes: '',
   })
 }
+
+// 把 draft.exercises 依 position 分群，保留每筆原本的 index 給 v-model 用
+const groupedDraft = computed(() => {
+  const positions = [...new Set(draft.value.exercises.map(e => e.position))].sort((a, b) => a - b)
+  return positions.map(pos => ({
+    position: pos,
+    items: draft.value.exercises
+      .map((ex, idx) => ({ idx, ex }))
+      .filter(item => item.ex.position === pos),
+  }))
+})
 function addPosition() {
   const lastPos = Math.max(...draft.value.exercises.map(e => e.position), 0)
   draft.value.exercises.push({
@@ -208,84 +307,211 @@ async function saveMenu() {
 
 // ---- 紀錄 ----
 const exerciseGroups = computed(() => menuDetail.value?.groups || [])
-const flatExercises = computed(() => exerciseGroups.value.flatMap(g => g.exercises))
 
+// ---- in-progress log lifecycle ----
+
+/** 開始紀錄新菜單。如果已有 in-progress 直接接續編輯 */
 async function startLog(menuId: number) {
-  await openMenu(menuId)
-  if (!menuDetail.value) return
-  logMenuId.value = menuId
-  // 為每個 exercise 預先建好 set 列 (用 target_sets 或 1)
-  logRows.value = flatExercises.value.map(ex => {
-    const numSets = ex.target_sets || 1
-    const sets: SetEntry[] = []
-    for (let i = 0; i < numSets; i++) {
-      sets.push({
-        exerciseId: ex.id, exerciseName: ex.name,
-        weight: '', reps: ex.target_reps?.toString() || '',
-      })
-    }
-    return { exercise: ex, sets }
-  })
-  logNotes.value = ''
-  tab.value = 'log'
-}
-
-function addSetRow(exerciseIdx: number) {
-  const row = logRows.value[exerciseIdx]
-  if (!row) return
-  const last = row.sets[row.sets.length - 1]
-  row.sets.push({
-    exerciseId: row.exercise.id, exerciseName: row.exercise.name,
-    weight: last?.weight || '', reps: last?.reps || '',
-  })
-}
-function removeSetRow(exerciseIdx: number, setIdx: number) {
-  const row = logRows.value[exerciseIdx]
-  if (!row || row.sets.length <= 1) return
-  row.sets.splice(setIdx, 1)
-}
-
-async function saveLog() {
   errorMsg.value = ''
   okMsg.value = ''
-  const sets: any[] = []
-  for (const row of logRows.value) {
-    row.sets.forEach((s, i) => {
-      // 至少要有 weight 或 reps 才存
-      if (!s.weight && !s.reps) return
-      sets.push({
-        exerciseId: row.exercise.id,
-        exerciseName: row.exercise.name,
-        setNumber: i + 1,
-        weightKg: s.weight ? Number(s.weight) : null,
-        reps: s.reps ? Number(s.reps) : null,
-      })
-    })
-  }
-  if (!sets.length) { errorMsg.value = '至少要填一組重量或次數'; return }
   try {
     const r = await fetch('/api/fitness/logs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({
-        menuId: logMenuId.value,
-        notes: logNotes.value.trim() || null,
-        sets,
-      }),
+      body: JSON.stringify({ menuId }),
     })
     if (!r.ok) throw new Error(`HTTP ${r.status}`)
-    okMsg.value = '✓ 紀錄已儲存'
-    // 清空，留在這頁讓使用者繼續 (or 切到 stats)
-    logRows.value = []
-    logMenuId.value = null
-    menuDetail.value = null
+    const d = await r.json()
+    if (d.resumed) {
+      okMsg.value = '已接續未完成的訓練 (請先完成或新開另一筆)'
+    }
+    await resumeInProgress()
+    tab.value = 'log'
+  } catch (e: any) { errorMsg.value = e?.message || '開始失敗' }
+}
+
+/** 從 server 取目前 in-progress log，更新本地狀態。回傳是否有 in-progress */
+async function resumeInProgress(): Promise<boolean> {
+  try {
+    const r = await fetch('/api/fitness/in-progress', { credentials: 'include' })
+    if (!r.ok) return false
+    const d = await r.json()
+    if (!d.log) {
+      logId.value = null
+      logMenuLoaded.value = null
+      logSets.value = []
+      return false
+    }
+    logId.value = d.log.id
+    currentPosition.value = d.log.current_position || 1
+    logNotes.value = d.log.notes || ''
+    if (d.log.menu_id) {
+      const mr = await fetch(`/api/fitness/menus/${d.log.menu_id}`, { credentials: 'include' })
+      if (mr.ok) logMenuLoaded.value = await mr.json()
+    }
+    logSets.value = (d.sets || []).map((s: any) => ({
+      id: s.id,
+      exerciseId: s.exercise_id,
+      exerciseName: s.exercise_name,
+      setNumber: s.set_number,
+      weightKg: s.weight_kg !== null ? Number(s.weight_kg) : null,
+      reps: s.reps,
+    }))
+    activeLaneIdx.value = 0
+    activeField.value = 'weight'
+    inputW.value = ''
+    inputR.value = ''
+    return true
+  } catch { return false }
+}
+
+// ---- keypad ----
+function setActiveField(f: 'weight' | 'reps') { activeField.value = f }
+function selectLane(idx: number) {
+  activeLaneIdx.value = idx
+  activeField.value = 'weight'
+  inputW.value = ''
+  inputR.value = ''
+}
+
+function pressDigit(d: string) {
+  if (activeField.value === 'weight') {
+    if (inputW.value === '0') inputW.value = d
+    else if (inputW.value.length < 6) inputW.value += d
+  } else {
+    if (inputR.value === '0') inputR.value = d
+    else if (inputR.value.length < 4) inputR.value += d
+  }
+}
+function pressDot() {
+  if (activeField.value !== 'weight') return
+  if (!inputW.value.includes('.')) inputW.value = (inputW.value || '0') + '.'
+}
+function pressBackspace() {
+  if (activeField.value === 'weight') inputW.value = inputW.value.slice(0, -1)
+  else inputR.value = inputR.value.slice(0, -1)
+}
+function pressClear() {
+  if (activeField.value === 'weight') inputW.value = ''
+  else inputR.value = ''
+}
+
+async function pressConfirm() {
+  if (!logId.value || !currentLane.value) return
+  const w = inputW.value ? parseFloat(inputW.value) : null
+  const r = inputR.value ? parseInt(inputR.value) : null
+  if (w === null && r === null) {
+    errorMsg.value = '請至少輸入重量或次數'
+    return
+  }
+  errorMsg.value = ''
+  try {
+    const res = await fetch(`/api/fitness/logs/${logId.value}/sets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({
+        exerciseId: currentLane.value.id,
+        exerciseName: currentLane.value.name,
+        weightKg: w,
+        reps: r,
+      }),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const d = await res.json()
+    logSets.value.push({
+      id: d.id,
+      exerciseId: d.exerciseId,
+      exerciseName: d.exerciseName,
+      setNumber: d.setNumber,
+      weightKg: d.weightKg,
+      reps: d.reps,
+    })
+    // 下一組常用同樣重量，所以只清 reps 並 focus
+    inputR.value = ''
+    activeField.value = 'reps'
+  } catch (e: any) { errorMsg.value = e?.message || '存檔失敗' }
+}
+
+// ---- per-set delete ----
+async function deleteRecordedSet(setId: number) {
+  if (!logId.value) return
+  if (!confirm('刪除這組？')) return
+  try {
+    await fetch(`/api/fitness/logs/${logId.value}/sets/${setId}`, {
+      method: 'DELETE', credentials: 'include',
+    })
+    logSets.value = logSets.value.filter(s => s.id !== setId)
+  } catch (e: any) { errorMsg.value = e?.message || '刪除失敗' }
+}
+
+// ---- position navigation ----
+async function patchLog(payload: any) {
+  if (!logId.value) return
+  await fetch(`/api/fitness/logs/${logId.value}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(payload),
+  })
+}
+
+async function saveNotes() {
+  if (!logId.value) return
+  await patchLog({ notes: logNotes.value })
+}
+async function nextPosition() {
+  if (!hasNextPosition.value) return
+  const newPos = positions.value[currentPositionIdx.value + 1]
+  await patchLog({ currentPosition: newPos })
+  currentPosition.value = newPos
+  selectLane(0)
+}
+async function prevPosition() {
+  if (!hasPrevPosition.value) return
+  const newPos = positions.value[currentPositionIdx.value - 1]
+  await patchLog({ currentPosition: newPos })
+  currentPosition.value = newPos
+  selectLane(0)
+}
+
+async function finishLog() {
+  if (!logId.value) return
+  if (!confirm('完成這次訓練？完成後不能再加組。')) return
+  try {
+    await fetch(`/api/fitness/logs/${logId.value}/finish`, {
+      method: 'POST', credentials: 'include',
+    })
+    okMsg.value = '✓ 訓練已完成'
+    logId.value = null
+    logMenuLoaded.value = null
+    logSets.value = []
     await loadStats()
     tab.value = 'stats'
-  } catch (e: any) { errorMsg.value = e?.message || '儲存失敗' }
+  } catch (e: any) { errorMsg.value = e?.message || '完成失敗' }
+}
+
+async function cancelLog() {
+  if (!logId.value) return
+  if (!confirm('放棄這次訓練？整筆 log 跟已記錄的組都會被刪掉、無法復原。')) return
+  try {
+    await fetch(`/api/fitness/logs/${logId.value}`, {
+      method: 'DELETE', credentials: 'include',
+    })
+    logId.value = null
+    logMenuLoaded.value = null
+    logSets.value = []
+    okMsg.value = '✓ 已放棄並刪除這次訓練'
+    tab.value = 'menus'
+  } catch (e: any) { errorMsg.value = e?.message || '刪除失敗' }
 }
 
 // ---- stats ----
+// 下拉選單：動作 + 使用者，'__ALL__' 都是顯示全部 (預設都顯示)
+const selectedExercise = ref<string>('__ALL__')
+const selectedUser = ref<string>('__ALL__')
+
 async function loadStats() {
   loading.value = true
   errorMsg.value = ''
@@ -323,6 +549,88 @@ const chartsByExercise = computed<ChartData[]>(() => {
   return out.sort((a, b) => a.exerciseName.localeCompare(b.exerciseName))
 })
 
+/** stats 裡所有 user 的清單 (給下拉用) */
+const allUsers = computed(() => {
+  const map = new Map<number, { id: number; name: string }>()
+  for (const r of stats.value) {
+    if (!map.has(r.user_id)) {
+      map.set(r.user_id, { id: r.user_id, name: r.display_name || r.username })
+    }
+  }
+  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name))
+})
+
+const visibleCharts = computed(() => {
+  let list = chartsByExercise.value
+  if (selectedExercise.value !== '__ALL__') {
+    list = list.filter(c => c.exerciseName === selectedExercise.value)
+  }
+  if (selectedUser.value !== '__ALL__') {
+    const uid = Number(selectedUser.value)
+    list = list
+      .map(c => ({ exerciseName: c.exerciseName, series: c.series.filter(s => s.userId === uid) }))
+      .filter(c => c.series.length > 0)
+  }
+  return list
+})
+
+// 點圖表的某個點 → 顯示該日該動作所有 user 的詳細 sets
+interface DaySetRow {
+  log_id: number
+  user_id: number
+  username: string
+  display_name: string | null
+  set_number: number
+  weight_kg: string | null
+  reps: number | null
+  exercise_name: string
+  performed_at: string
+}
+interface DayDetailGroup {
+  username: string
+  display_name: string | null
+  sets: DaySetRow[]
+}
+const dayDetailFor = ref<{ day: string; exerciseName: string; userId: number | null; userName: string | null } | null>(null)
+const dayDetailSets = ref<DaySetRow[]>([])
+const dayDetailLoading = ref(false)
+
+async function openDayDetail(exerciseName: string, day: string, userId?: number, userName?: string) {
+  // 防呆：day 可能來自 chart 點點，slice 取前 10 字確保 YYYY-MM-DD
+  day = String(day).slice(0, 10)
+  dayDetailFor.value = { day, exerciseName, userId: userId ?? null, userName: userName ?? null }
+  dayDetailSets.value = []
+  dayDetailLoading.value = true
+  try {
+    let url = `/api/fitness/sets?day=${encodeURIComponent(day)}&exercise=${encodeURIComponent(exerciseName)}`
+    if (userId) url += `&user=${userId}`
+    const r = await fetch(url, { credentials: 'include' })
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    const d = await r.json()
+    dayDetailSets.value = d.sets || []
+  } catch (e: any) { errorMsg.value = e?.message || '載入失敗' }
+  finally { dayDetailLoading.value = false }
+}
+
+function closeDayDetail() {
+  dayDetailFor.value = null
+  dayDetailSets.value = []
+}
+
+const dayDetailGroups = computed<DayDetailGroup[]>(() => {
+  const map = new Map<string, DayDetailGroup>()
+  for (const s of dayDetailSets.value) {
+    const key = String(s.user_id)
+    let g = map.get(key)
+    if (!g) {
+      g = { username: s.username, display_name: s.display_name, sets: [] }
+      map.set(key, g)
+    }
+    g.sets.push(s)
+  }
+  return Array.from(map.values())
+})
+
 // 顏色給每個 user 一個固定色 (依 username hash)
 function colorFor(username: string): string {
   let h = 0
@@ -339,11 +647,14 @@ function fmtDay(s: string) { return s.slice(5) }     // MM-DD
 // SVG line chart 子 component (避免拆檔)
 // =========================================================================
 const Chart = defineComponent({
-  props: { data: { type: Object as any, required: true } },
+  props: {
+    data: { type: Object as any, required: true },
+    onPointClick: { type: Function as any, default: null },
+  },
   setup(props: any) {
     const W = 720
-    const H = 220
-    const pad = { l: 40, r: 16, t: 12, b: 28 }
+    const H = 240
+    const pad = { l: 48, r: 24, t: 22, b: 36 }
 
     const dims = computed(() => {
       const all = props.data.series.flatMap((s: any) => s.points)
@@ -373,6 +684,31 @@ const Chart = defineComponent({
       const d = dims.value
       if (!d) return h('div', { class: 'chart-empty' }, '無資料')
 
+      // 軸線 (y left, x bottom)
+      const axes: any[] = [
+        // y 軸
+        h('line', {
+          x1: pad.l, y1: pad.t, x2: pad.l, y2: H - pad.b,
+          stroke: 'rgba(255,255,255,.22)', 'stroke-width': 1,
+        }),
+        // x 軸
+        h('line', {
+          x1: pad.l, y1: H - pad.b, x2: W - pad.r, y2: H - pad.b,
+          stroke: 'rgba(255,255,255,.22)', 'stroke-width': 1,
+        }),
+        // y 軸標籤 "kg" (左上)
+        h('text', {
+          x: pad.l - 4, y: pad.t - 8, 'text-anchor': 'end',
+          fill: 'rgba(255,255,255,.65)', 'font-size': 11, 'font-weight': 600,
+        }, 'kg'),
+        // x 軸標籤 "日期" (右下)
+        h('text', {
+          x: W - pad.r, y: H - 6, 'text-anchor': 'end',
+          fill: 'rgba(255,255,255,.65)', 'font-size': 11, 'font-weight': 600,
+        }, '日期'),
+      ]
+
+      // y 刻度 + grid lines
       const yTicks: any[] = []
       const ySteps = 4
       for (let i = 0; i <= ySteps; i++) {
@@ -383,24 +719,38 @@ const Chart = defineComponent({
             x1: pad.l, x2: W - pad.r, y1: y, y2: y,
             stroke: 'rgba(255,255,255,.05)', 'stroke-dasharray': '2 4',
           }),
+          // tick mark on axis
+          h('line', {
+            x1: pad.l - 4, x2: pad.l, y1: y, y2: y,
+            stroke: 'rgba(255,255,255,.45)', 'stroke-width': 1,
+          }),
           h('text', {
-            x: pad.l - 6, y: y + 4, 'text-anchor': 'end',
-            fill: 'rgba(255,255,255,.4)', 'font-size': 10,
+            x: pad.l - 8, y: y + 4, 'text-anchor': 'end',
+            fill: 'rgba(255,255,255,.55)', 'font-size': 11,
           }, v.toFixed(0)),
         ]))
       }
 
+      // x 刻度
       const xTicks: any[] = []
       const showEvery = Math.max(1, Math.ceil(d.days.length / 6))
       d.days.forEach((day: string, i: number) => {
         if (i % showEvery !== 0 && i !== d.days.length - 1) return
         const x = d.xOf(day)
-        xTicks.push(h('text', {
-          x, y: H - pad.b + 14, 'text-anchor': 'middle',
-          fill: 'rgba(255,255,255,.4)', 'font-size': 10,
-        }, day.slice(5)))
+        xTicks.push(h('g', { key: 'xt' + i }, [
+          // tick mark on axis
+          h('line', {
+            x1: x, x2: x, y1: H - pad.b, y2: H - pad.b + 4,
+            stroke: 'rgba(255,255,255,.45)', 'stroke-width': 1,
+          }),
+          h('text', {
+            x, y: H - pad.b + 18, 'text-anchor': 'middle',
+            fill: 'rgba(255,255,255,.55)', 'font-size': 11,
+          }, day.slice(5)),
+        ]))
       })
 
+      // 折線與資料點
       const lines: any[] = []
       const points: any[] = []
       for (const s of props.data.series) {
@@ -415,15 +765,17 @@ const Chart = defineComponent({
         }))
         for (const p of sorted) {
           points.push(h('circle', {
-            cx: d.xOf(p.day), cy: d.yOf(p.value), r: 3,
+            cx: d.xOf(p.day), cy: d.yOf(p.value), r: 4,
             fill: c, stroke: '#0d0d0d', 'stroke-width': 1.5,
-          }, [h('title', null, `${s.username} · ${p.day} · ${p.value} kg`)]))
+            style: 'cursor: pointer',
+            onClick: () => props.onPointClick?.(p.day, s.userId, s.username),
+          }, [h('title', null, `${s.username} · ${p.day} · ${p.value} kg (點看 ${s.username} 當天詳細)`)]))
         }
       }
 
       return h('svg', {
         width: W, height: H, class: 'chart-svg', viewBox: `0 0 ${W} ${H}`,
-      }, [...yTicks, ...xTicks, ...lines, ...points])
+      }, [...yTicks, ...xTicks, ...axes, ...lines, ...points])
     }
   },
 })
@@ -434,6 +786,9 @@ const Chart = defineComponent({
 onMounted(async () => {
   await fetchMe()
   await loadMenus()
+  // 進來自動接上未完成的訓練
+  const resumed = await resumeInProgress()
+  if (resumed) tab.value = 'log'
 })
 </script>
 
@@ -449,6 +804,9 @@ onMounted(async () => {
       </button>
       <button :class="['tab', { active: tab === 'stats' }]" @click="() => { loadStats(); tab = 'stats' }">
         <span class="tab-glyph">📈</span> 大家的成長
+      </button>
+      <button :class="['tab', { active: tab === 'feed' }]" @click="() => { loadFeed(); tab = 'feed' }">
+        <span class="tab-glyph">💬</span> 留言板
       </button>
     </nav>
 
@@ -505,54 +863,143 @@ onMounted(async () => {
     </section>
 
     <!-- ==================== 紀錄 tab ==================== -->
-    <section v-if="tab === 'log'" class="page">
-      <header class="head">
-        <div>
-          <p class="kicker">LOG SESSION</p>
-          <h2>記錄這次訓練</h2>
-        </div>
-      </header>
-
-      <div v-if="!logRows.length" class="empty">
-        請先到「菜單」頁選一份菜單，按「▶ 開始紀錄」進來。
+    <section v-if="tab === 'log'" class="page log-page">
+      <div v-if="!logId" class="empty">
+        請先到「菜單」tab 選一份菜單，按「▶ 開始紀錄」進來。
       </div>
 
-      <div v-else class="log-form">
-        <p class="muted">{{ flatExercises.length }} 個動作，依序填入重量 (kg) 與次數。空白格不會儲存。</p>
+      <template v-else-if="!currentGroup">
+        <div class="empty">菜單沒有 POSITION 資料。</div>
+      </template>
 
-        <div v-for="(row, idx) in logRows" :key="row.exercise.id" class="log-block">
-          <div class="log-block-head">
-            <span class="kicker">{{ row.exercise.position }}.{{ row.exercise.slot }}</span>
-            <h4>{{ row.exercise.name }}</h4>
-            <span v-if="row.exercise.target_sets || row.exercise.target_reps" class="hint">
-              建議 {{ row.exercise.target_sets || '?' }} × {{ row.exercise.target_reps || '?' }}
-            </span>
+      <template v-else>
+        <!-- POSITION navigation -->
+        <header class="pos-nav">
+          <button class="ico-btn" :disabled="!hasPrevPosition" @click="prevPosition">‹</button>
+          <div class="pos-label">
+            <span class="kicker">POSITION</span>
+            <span class="pos-num">{{ currentPositionIdx + 1 }} / {{ positionsCount }}</span>
           </div>
+          <button class="ico-btn" :disabled="!hasNextPosition" @click="nextPosition">›</button>
+        </header>
 
-          <div class="set-grid">
-            <div class="set-grid-head">
-              <span>SET</span>
-              <span>重量 (kg)</span>
-              <span>次數</span>
-              <span></span>
-            </div>
-            <div v-for="(s, sIdx) in row.sets" :key="sIdx" class="set-row">
-              <span class="set-num">#{{ sIdx + 1 }}</span>
-              <input v-model="s.weight" type="number" step="0.5" placeholder="0" />
-              <input v-model="s.reps" type="number" placeholder="0" />
-              <button class="ico" @click="removeSetRow(idx, sIdx)" :disabled="row.sets.length <= 1">×</button>
-            </div>
-          </div>
-          <button class="btn-ghost small" @click="addSetRow(idx)">+ 加一組</button>
+        <!-- Lane tabs (superset 才會有 >1 個) -->
+        <div v-if="currentGroup.exercises.length > 1" class="lane-tabs">
+          <button
+            v-for="(ex, i) in currentGroup.exercises"
+            :key="ex.id"
+            :class="['lane-tab', { active: activeLaneIdx === i }]"
+            @click="selectLane(i)"
+          >
+            <span class="tag">{{ currentGroup.position }}.{{ ex.slot }}</span>
+            {{ ex.name }}
+          </button>
         </div>
 
-        <label class="field">
-          <span>備註 (整次訓練)</span>
-          <textarea v-model="logNotes" rows="2" placeholder="今天身體狀況、感受…" />
+        <div class="log-body">
+        <div class="log-left">
+        <!-- 目前動作 header -->
+        <div class="ex-head">
+          <div>
+            <p class="ex-title">{{ currentLane?.name }}</p>
+            <p class="ex-sub">
+              <span v-if="setsForCurrentLane.length">{{ setsForCurrentLane.length }} 組</span>
+              <span v-else>尚未紀錄</span>
+              <span v-if="currentLane?.target_sets || currentLane?.target_reps" class="ex-target">
+                · 建議 {{ currentLane.target_sets || '?' }} × {{ currentLane.target_reps || '?' }}
+              </span>
+            </p>
+          </div>
+          <div class="ex-vol">
+            <p class="vol-num">{{ totalVolumeForLane.toFixed(0) }}</p>
+            <p class="vol-unit">kg total</p>
+          </div>
+        </div>
+
+        <!-- 已紀錄的 sets -->
+        <ul class="set-list">
+          <li v-for="s in setsForCurrentLane" :key="s.id" class="set-li">
+            <span class="set-li-num">{{ s.setNumber }}</span>
+            <span class="set-li-body">
+              <span class="num">{{ s.weightKg ?? '-' }}</span>
+              <span class="lbl">kg</span>
+              <span class="x">×</span>
+              <span class="num">{{ s.reps ?? '-' }}</span>
+              <span class="lbl">reps</span>
+            </span>
+            <button class="trash" @click="deleteRecordedSet(s.id)" title="刪除">🗑</button>
+          </li>
+          <li v-if="!setsForCurrentLane.length" class="set-li empty-li">
+            這個動作還沒紀錄任何組
+          </li>
+        </ul>
+
+        <!-- 備註 — 自動存 (失焦時 PATCH)，「完成訓練」後會出現在留言板 -->
+        <label class="notes-field">
+          <span class="notes-label">📝 備註 (整次訓練)</span>
+          <textarea
+            v-model="logNotes"
+            rows="2"
+            placeholder="今天感受、配重、注意事項…完成後會出現在「留言板」"
+            @blur="saveNotes"
+          />
         </label>
 
-        <button class="btn-primary lg" @click="saveLog">儲存紀錄</button>
-      </div>
+        <!-- 動作完成 / 訓練完成 按鈕 -->
+        <div class="log-actions">
+          <button v-if="hasNextPosition" class="btn-primary" @click="nextPosition">
+            下一個 POSITION →
+          </button>
+          <button v-else class="btn-primary" @click="finishLog">
+            ✓ 完成訓練
+          </button>
+          <button class="btn-ghost danger small" @click="cancelLog">放棄</button>
+        </div>
+        </div> <!-- /log-left -->
+
+        <!-- 數字鍵盤 -->
+        <div class="log-right">
+        <div class="keypad-section">
+          <div class="tiles">
+            <button
+              :class="['tile', { active: activeField === 'weight' }]"
+              @click="setActiveField('weight')"
+            >
+              <span class="tile-val">{{ inputW || '0' }}</span>
+              <span class="tile-unit">kg</span>
+            </button>
+            <button
+              :class="['tile', { active: activeField === 'reps' }]"
+              @click="setActiveField('reps')"
+            >
+              <span class="tile-val">{{ inputR || '0' }}</span>
+              <span class="tile-unit">reps</span>
+            </button>
+          </div>
+
+          <div class="keypad">
+            <button class="key" @click="pressDigit('7')">7</button>
+            <button class="key" @click="pressDigit('8')">8</button>
+            <button class="key" @click="pressDigit('9')">9</button>
+            <button class="key fn" @click="pressBackspace">⌫</button>
+
+            <button class="key" @click="pressDigit('4')">4</button>
+            <button class="key" @click="pressDigit('5')">5</button>
+            <button class="key" @click="pressDigit('6')">6</button>
+            <button class="key fn" @click="pressClear">C</button>
+
+            <button class="key" @click="pressDigit('1')">1</button>
+            <button class="key" @click="pressDigit('2')">2</button>
+            <button class="key" @click="pressDigit('3')">3</button>
+            <button class="key confirm" @click="pressConfirm">✓</button>
+
+            <button class="key dot" @click="pressDot">.</button>
+            <button class="key zero" @click="pressDigit('0')">0</button>
+          </div>
+        </div>
+        </div> <!-- /log-right -->
+        </div> <!-- /log-body -->
+      </template>
     </section>
 
     <!-- ==================== 大家的成長 tab ==================== -->
@@ -560,27 +1007,86 @@ onMounted(async () => {
       <header class="head">
         <div>
           <p class="kicker">DASHBOARD</p>
-          <h2>大家的成長曲線 (依動作分)</h2>
+          <h2>大家的成長曲線</h2>
         </div>
-        <button class="btn-ghost" @click="loadStats">↻ 重新載入</button>
+        <div class="head-actions">
+          <select v-model="selectedExercise" class="ex-select" :disabled="!chartsByExercise.length">
+            <option value="__ALL__">所有動作 ({{ chartsByExercise.length }})</option>
+            <option
+              v-for="c in chartsByExercise"
+              :key="c.exerciseName"
+              :value="c.exerciseName"
+            >{{ c.exerciseName }}</option>
+          </select>
+          <select v-model="selectedUser" class="ex-select" :disabled="!allUsers.length">
+            <option value="__ALL__">所有使用者 ({{ allUsers.length }})</option>
+            <option
+              v-for="u in allUsers"
+              :key="u.id"
+              :value="String(u.id)"
+            >{{ u.name }}</option>
+          </select>
+          <button class="btn-ghost" @click="loadStats">↻ 重新載入</button>
+        </div>
       </header>
 
       <div v-if="loading && !chartsByExercise.length" class="muted">LOADING…</div>
       <div v-else-if="!chartsByExercise.length" class="empty">還沒有任何紀錄。先去記一次！</div>
 
       <div v-else class="charts">
-        <article v-for="c in chartsByExercise" :key="c.exerciseName" class="chart-card">
+        <article v-for="c in visibleCharts" :key="c.exerciseName" class="chart-card">
           <header class="chart-head">
             <h3>{{ c.exerciseName }}</h3>
-            <p class="muted">y 軸 = 該日最大重量 (kg)，x 軸 = 日期</p>
+            <p class="muted">點任一資料點看當天所有人的詳細 sets</p>
           </header>
-          <Chart :data="c" />
+          <Chart
+            :data="c"
+            :on-point-click="(day: string, uid: number, uname: string) => openDayDetail(c.exerciseName, day, uid, uname)"
+          />
           <ul class="legend">
             <li v-for="s in c.series" :key="s.userId">
               <span class="legend-dot" :style="{ background: colorFor(s.username) }" />
               {{ s.username }} <em>{{ s.points.length }} 天</em>
             </li>
           </ul>
+
+          <!-- 當日詳細 sets 面板 -->
+          <div
+            v-if="dayDetailFor && dayDetailFor.exerciseName === c.exerciseName"
+            class="day-detail"
+          >
+            <div class="day-detail-head">
+              <p class="kicker">
+                {{ dayDetailFor.day }} · {{ dayDetailFor.exerciseName }}<span
+                  v-if="dayDetailFor.userName"
+                > · {{ dayDetailFor.userName }}</span>
+              </p>
+              <button class="ico-x" @click="closeDayDetail">×</button>
+            </div>
+            <div v-if="dayDetailLoading" class="muted">LOADING…</div>
+            <div v-else-if="!dayDetailGroups.length" class="muted">當天沒有紀錄</div>
+            <div v-else class="day-detail-body">
+              <div v-for="g in dayDetailGroups" :key="g.username" class="day-user">
+                <div class="day-user-head">
+                  <span class="user-dot" :style="{ background: colorFor(g.display_name || g.username) }" />
+                  <span class="user-name">{{ g.display_name || g.username }}</span>
+                  <span class="user-count">{{ g.sets.length }} 組</span>
+                </div>
+                <ul class="day-set-list">
+                  <li v-for="s in g.sets" :key="s.log_id + '-' + s.set_number">
+                    <span class="dset-num">#{{ s.set_number }}</span>
+                    <span class="dset-body">
+                      <span class="num">{{ s.weight_kg ?? '-' }}</span>
+                      <span class="lbl">kg</span>
+                      <span class="x">×</span>
+                      <span class="num">{{ s.reps ?? '-' }}</span>
+                      <span class="lbl">reps</span>
+                    </span>
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </div>
         </article>
       </div>
 
@@ -606,6 +1112,49 @@ onMounted(async () => {
       <p v-else class="muted">尚無紀錄</p>
     </section>
 
+    <!-- ==================== 留言板 tab ==================== -->
+    <section v-if="tab === 'feed'" class="page">
+      <header class="head">
+        <div>
+          <p class="kicker">FEED</p>
+          <h2>大家的訓練留言</h2>
+        </div>
+        <button class="btn-ghost" @click="loadFeed">↻ 重新載入</button>
+      </header>
+
+      <div v-if="loading && !feed.length" class="muted">LOADING…</div>
+      <div v-else-if="!feed.length" class="empty">
+        還沒有任何完成的訓練留言。<br>
+        在「紀錄」頁完成訓練時填備註就會出現在這裡。
+      </div>
+
+      <ul v-else class="feed-list">
+        <li v-for="f in feed" :key="f.id" class="feed-card">
+          <div class="feed-head">
+            <div class="feed-avatar">
+              {{ (f.display_name || f.username).slice(0, 1).toUpperCase() }}
+            </div>
+            <div class="feed-meta">
+              <p class="feed-user">{{ f.display_name || f.username }}</p>
+              <p class="feed-time">{{ relTime(f.completed_at) }} · {{ fmtTime(f.completed_at) }}</p>
+            </div>
+          </div>
+
+          <p v-if="f.menu_name" class="feed-menu">
+            <span class="kicker">MENU</span> {{ f.menu_name }}
+          </p>
+
+          <p class="feed-notes">{{ f.notes }}</p>
+
+          <ul class="feed-stats">
+            <li><span class="n">{{ f.set_count }}</span><span class="lbl">組</span></li>
+            <li><span class="n">{{ f.exercise_count }}</span><span class="lbl">動作</span></li>
+            <li><span class="n">{{ Number(f.total_volume || 0).toFixed(0) }}</span><span class="lbl">kg total</span></li>
+          </ul>
+        </li>
+      </ul>
+    </section>
+
     <!-- ==================== Builder modal ==================== -->
     <div v-if="showBuilder" class="overlay" @click.self="showBuilder = false">
       <div class="builder">
@@ -627,28 +1176,23 @@ onMounted(async () => {
           <p class="kicker">EXERCISES</p>
           <p class="muted small">同一 position 多個 slot = 超組合 (superset)。第一個 position 想做組合，按下方「+ 加超組合到此 group」</p>
 
-          <template v-for="pos in [...new Set(draft.exercises.map(e => e.position))].sort((a, b) => a - b)" :key="pos">
+          <template v-for="g in groupedDraft" :key="g.position">
             <div class="builder-group">
               <p class="group-label">
-                <span class="kicker">POSITION {{ pos }}</span>
-                <span v-if="draft.exercises.filter(e => e.position === pos).length > 1" class="superset-badge">
-                  SUPERSET ×{{ draft.exercises.filter(e => e.position === pos).length }}
+                <span class="kicker">POSITION {{ g.position }}</span>
+                <span v-if="g.items.length > 1" class="superset-badge">
+                  SUPERSET ×{{ g.items.length }}
                 </span>
               </p>
-              <div
-                v-for="(ex, idx) in draft.exercises"
-                v-if="ex.position === pos"
-                :key="idx"
-                class="builder-ex"
-              >
-                <span class="ex-tag">{{ pos }}.{{ ex.slot }}</span>
-                <input v-model="ex.name" type="text" placeholder="動作名稱 *" class="grow" />
-                <input v-model="ex.target_sets" type="number" placeholder="組" class="num-input" />
-                <input v-model="ex.target_reps" type="number" placeholder="次" class="num-input" />
-                <input v-model="ex.notes" type="text" placeholder="備註" class="grow" />
-                <button class="ico" @click="removeExercise(idx)" :disabled="draft.exercises.length <= 1">×</button>
+              <div v-for="item in g.items" :key="item.idx" class="builder-ex">
+                <span class="ex-tag">{{ g.position }}.{{ item.ex.slot }}</span>
+                <input v-model="item.ex.name" type="text" placeholder="動作名稱 *" class="grow" />
+                <input v-model="item.ex.target_sets" type="number" placeholder="組" class="num-input" />
+                <input v-model="item.ex.target_reps" type="number" placeholder="次" class="num-input" />
+                <input v-model="item.ex.notes" type="text" placeholder="備註" class="grow" />
+                <button class="ico" @click="removeExercise(item.idx)" :disabled="draft.exercises.length <= 1">×</button>
               </div>
-              <button class="btn-ghost tiny" @click="addSlot(pos)">+ 加超組合到此 group</button>
+              <button class="btn-ghost tiny" @click="addSlot(g.position)">+ 加超組合到此 group</button>
             </div>
           </template>
 
@@ -824,6 +1368,375 @@ onMounted(async () => {
 }
 .field textarea:focus { border-color: var(--tx-2); }
 
+/* ==================== 紀錄頁 (RWD: 手機單欄 / 桌機左右兩欄) ==================== */
+.log-page {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+/* 主體 = ex-head + set-list + log-actions (左) + keypad (右) */
+.log-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.log-left {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+.log-right {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* 桌機：左右兩欄 (鍵盤固定 380px) */
+@media (min-width: 768px) {
+  .log-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 380px;
+    gap: 24px;
+    align-items: start;
+  }
+  .log-right {
+    position: sticky;
+    top: 16px;
+  }
+}
+
+/* 手機：set list 可以縮窄 */
+@media (max-width: 767px) {
+  .log-page { max-width: 540px; }
+  .tile { height: 64px; }
+  .tile-val { font-size: 26px; }
+  .key { height: 52px; font-size: 20px; }
+}
+
+.pos-nav {
+  display: grid;
+  grid-template-columns: 48px 1fr 48px;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--bg-tile);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+}
+.ico-btn {
+  width: 44px; height: 44px;
+  border-radius: var(--r-sm);
+  background: var(--bg-input);
+  border: 1px solid var(--line-2);
+  color: var(--tx-1);
+  font-size: 22px;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.ico-btn:hover:not(:disabled) { background: var(--hover-bg); }
+.ico-btn:disabled { opacity: .25; cursor: not-allowed; }
+.pos-label { text-align: center; }
+.pos-label .kicker { display: block; font-size: 10px; }
+.pos-num {
+  font-size: 18px;
+  font-weight: 600;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  margin-top: 2px;
+}
+
+/* lane tabs (superset) */
+.lane-tabs {
+  display: flex; gap: 6px;
+  flex-wrap: wrap;
+  padding: 8px;
+  background: var(--bg-tile);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+}
+.lane-tab {
+  flex: 1; min-width: 0;
+  padding: 10px 12px;
+  background: transparent;
+  color: var(--tx-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-sm);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  display: flex; flex-direction: column; gap: 2px;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.lane-tab:hover { background: rgba(255,255,255,.04); color: var(--tx-1); }
+.lane-tab.active {
+  background: var(--tx-1);
+  color: #000;
+  border-color: var(--tx-1);
+}
+.lane-tab .tag {
+  font-size: 9.5px;
+  letter-spacing: .14em;
+  opacity: .6;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+.lane-tab.active .tag { opacity: .55; }
+
+/* 當前動作 header */
+.ex-head {
+  display: flex; justify-content: space-between; align-items: flex-end;
+  padding: 14px 18px;
+  background: var(--bg-tile);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+}
+.ex-title {
+  font-size: 17px; font-weight: 500; margin: 0;
+}
+.ex-sub {
+  font-size: 12px; color: var(--tx-3); margin-top: 4px;
+}
+.ex-target { margin-left: 4px; }
+.ex-vol { text-align: right; }
+.vol-num {
+  font-size: 26px; font-weight: 600; line-height: 1;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  color: var(--tx-1); margin: 0;
+}
+.vol-unit { font-size: 10px; color: var(--tx-3); margin-top: 4px; letter-spacing: .14em; }
+
+/* 已紀錄 sets list */
+.set-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex; flex-direction: column;
+  gap: 6px;
+}
+.set-li {
+  display: grid;
+  grid-template-columns: 44px 1fr 44px;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 12px;
+  background: var(--bg-tile);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-sm);
+}
+.set-li-num {
+  width: 32px; height: 32px;
+  display: grid; place-items: center;
+  background: var(--bg-input);
+  border-radius: 6px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 13px;
+  color: var(--tx-2);
+}
+.set-li-body {
+  display: flex; align-items: baseline; gap: 6px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+.set-li-body .num { font-size: 17px; color: var(--tx-1); font-weight: 500; }
+.set-li-body .lbl { font-size: 10px; color: var(--tx-3); letter-spacing: .1em; }
+.set-li-body .x { color: var(--tx-3); margin: 0 4px; }
+.trash {
+  width: 34px; height: 34px;
+  border-radius: 6px;
+  background: transparent;
+  border: 1px solid var(--line-2);
+  color: var(--tx-3);
+  font-size: 14px;
+  cursor: pointer;
+  transition: color .12s, background .12s;
+}
+.trash:hover { color: var(--danger); background: rgba(255,77,79,.08); }
+.empty-li {
+  grid-template-columns: 1fr;
+  color: var(--tx-3); font-size: 12.5px;
+  text-align: center;
+  padding: 14px 12px;
+  border-style: dashed;
+}
+
+/* 備註欄 */
+.notes-field {
+  display: flex; flex-direction: column;
+  background: var(--bg-tile);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  padding: 12px 16px;
+}
+.notes-label {
+  font-size: 11px;
+  letter-spacing: .14em;
+  color: var(--tx-3);
+  margin-bottom: 8px;
+}
+.notes-field textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line-2);
+  background: var(--bg-input);
+  color: var(--tx-1);
+  border-radius: var(--r-sm);
+  outline: none;
+  resize: vertical;
+  font: inherit;
+  font-size: 13px;
+  min-height: 60px;
+  transition: border-color .15s;
+}
+.notes-field textarea:focus { border-color: var(--tx-2); }
+
+/* 完成 / 下一個 POSITION 操作 */
+.log-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.log-actions .btn-primary { flex: 1; padding: 12px; }
+
+/* 數字鍵盤區 */
+.keypad-section {
+  margin-top: 6px;
+  display: flex; flex-direction: column;
+  gap: 8px;
+}
+.tiles {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.tile {
+  position: relative;
+  height: 70px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  background: var(--bg-tile);
+  border: 2px solid var(--line-2);
+  border-radius: var(--r-md);
+  cursor: pointer;
+  transition: border-color .12s, background .12s;
+  padding: 4px 8px;
+}
+.tile.active {
+  border-color: var(--tx-1);
+  background: rgba(255,255,255,.05);
+}
+.tile-val {
+  font-size: 30px; font-weight: 500;
+  color: var(--tx-1);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  line-height: 1;
+}
+.tile-unit {
+  font-size: 11px; color: var(--tx-3);
+  margin-top: 4px;
+  letter-spacing: .14em;
+}
+
+.keypad {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+.key {
+  height: 56px;
+  background: var(--bg-tile);
+  color: var(--tx-1);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-sm);
+  font-size: 22px;
+  font-weight: 500;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  cursor: pointer;
+  transition: background .12s, transform .05s;
+}
+.key:hover { background: var(--hover-bg); }
+.key:active { transform: scale(.96); }
+.key.fn { font-size: 18px; color: var(--tx-2); }
+.key.dot { grid-column: span 1; font-size: 26px; }
+.key.zero { grid-column: span 2; font-size: 22px; }
+.key.confirm {
+  background: var(--tx-1);
+  color: #000;
+  font-size: 22px;
+  font-weight: 700;
+  border-color: var(--tx-1);
+  grid-row: span 1;
+}
+.key.confirm:hover { opacity: .9; }
+
+/* superset 交錯排列 (legacy CSS — 已不用於 log tab，但保留給將來) */
+.superset-hint {
+  font-size: 12px; color: var(--tx-3); margin: -4px 0 14px;
+}
+.round-block {
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-sm);
+  background: rgba(255, 255, 255, .015);
+}
+.round-label {
+  display: flex; align-items: center;
+  margin-bottom: 8px;
+}
+.round-tag {
+  font-size: 10.5px; letter-spacing: .14em;
+  color: var(--tx-2);
+  background: rgba(255,255,255,.04);
+  border: 1px solid var(--line-2);
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+.superset-grid {
+  display: flex; flex-direction: column; gap: 6px;
+}
+.set-grid-head.superset-head {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr;
+  gap: 10px;
+}
+.set-row.superset-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr;
+  gap: 10px;
+}
+.lane-name {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px;
+  color: var(--tx-1);
+}
+.ex-tag {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10.5px;
+  color: var(--tx-3);
+  background: var(--bg-input);
+  border: 1px solid var(--line-2);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.round-actions { display: flex; gap: 8px; margin-top: 4px; }
+
+/* dashboard 下拉 */
+.head-actions { display: flex; gap: 10px; align-items: center; }
+.ex-select {
+  background: var(--bg-input);
+  border: 1px solid var(--line-2);
+  color: var(--tx-1);
+  padding: 8px 12px;
+  border-radius: var(--r-sm);
+  font-size: 13px;
+  min-width: 200px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.ex-select:focus { border-color: var(--tx-2); outline: none; }
+.ex-select:disabled { opacity: .5; cursor: not-allowed; }
+
 .btn-primary.lg { padding: 13px 24px; font-size: 13.5px; align-self: flex-start; }
 .btn-ghost.small { padding: 4px 10px; font-size: 11.5px; }
 .btn-ghost.tiny { padding: 4px 8px; font-size: 10.5px; }
@@ -862,6 +1775,73 @@ onMounted(async () => {
 .legend-dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
 .legend em { color: var(--tx-3); font-style: normal; font-size: 11px; }
 
+/* 點圖表後出現的當日詳細 panel */
+.day-detail {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-2);
+}
+.day-detail-head {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 12px;
+}
+.day-detail-head .kicker {
+  font-size: 11px; letter-spacing: .14em;
+  color: var(--tx-2);
+}
+.ico-x {
+  width: 28px; height: 28px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--tx-3);
+  border: 1px solid var(--line-2);
+  font-size: 16px;
+  cursor: pointer;
+}
+.ico-x:hover { background: rgba(255,255,255,.04); color: var(--tx-1); }
+
+.day-detail-body { display: flex; flex-direction: column; gap: 12px; }
+.day-user {
+  background: var(--bg-input);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-sm);
+  padding: 10px 12px;
+}
+.day-user-head {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 8px;
+}
+.user-dot {
+  width: 10px; height: 10px; border-radius: 999px;
+}
+.user-name { font-size: 13px; font-weight: 500; color: var(--tx-1); flex: 1; }
+.user-count {
+  font-size: 11px; color: var(--tx-3);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+.day-set-list {
+  list-style: none; padding: 0; margin: 0;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.day-set-list li {
+  display: grid;
+  grid-template-columns: 40px 1fr;
+  gap: 10px; align-items: center;
+  padding: 4px 0;
+}
+.dset-num {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--tx-3);
+}
+.dset-body {
+  display: flex; align-items: baseline; gap: 4px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+.dset-body .num { font-size: 14px; color: var(--tx-1); font-weight: 500; }
+.dset-body .lbl { font-size: 10px; color: var(--tx-3); letter-spacing: .1em; }
+.dset-body .x { color: var(--tx-3); margin: 0 4px; }
+
 /* logs table */
 .logs-table {
   width: 100%; border-collapse: collapse;
@@ -884,6 +1864,89 @@ onMounted(async () => {
 }
 .logs-table td.num { text-align: right; font-family: 'JetBrains Mono', ui-monospace, monospace; }
 .muted-cell { color: var(--tx-3); font-size: 12.5px; }
+
+/* ==================== 留言板 (feed) ==================== */
+.feed-list {
+  list-style: none; padding: 0; margin: 0;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.feed-card {
+  background: var(--bg-tile);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  padding: 16px 18px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.feed-head {
+  display: flex; align-items: center; gap: 12px;
+}
+.feed-avatar {
+  width: 36px; height: 36px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, hsl(220, 50%, 50%), hsl(280, 50%, 50%));
+  display: grid; place-items: center;
+  color: var(--tx-1);
+  font-weight: 600;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+.feed-meta { flex: 1; min-width: 0; }
+.feed-user {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--tx-1);
+  margin: 0;
+}
+.feed-time {
+  font-size: 11px;
+  color: var(--tx-3);
+  margin: 2px 0 0;
+}
+.feed-menu {
+  font-size: 12.5px;
+  color: var(--tx-2);
+  margin: 0;
+  padding: 6px 10px;
+  background: var(--bg-input);
+  border-radius: var(--r-sm);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  align-self: flex-start;
+}
+.feed-menu .kicker {
+  font-size: 10px;
+}
+.feed-notes {
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--tx-1);
+  white-space: pre-wrap;
+  margin: 4px 0 6px;
+}
+.feed-stats {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex; gap: 16px;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-1);
+}
+.feed-stats li {
+  display: flex; align-items: baseline; gap: 4px;
+}
+.feed-stats .n {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--tx-1);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+.feed-stats .lbl {
+  font-size: 11px;
+  color: var(--tx-3);
+  letter-spacing: .14em;
+}
 
 /* builder modal */
 .overlay {
