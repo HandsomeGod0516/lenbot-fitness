@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, defineComponent, h } from 'vue'
+import { ref, computed, onMounted, onUnmounted, defineComponent, h } from 'vue'
 
 // =========================================================================
 // types
@@ -224,13 +224,16 @@ async function openMenu(id: number) {
   finally { loading.value = false }
 }
 
-async function deleteMenu(id: number) {
-  if (!confirm('確定刪除這個菜單？歷史紀錄保留但 menu_id 會清空。')) return
+async function deleteMenu(id: number, name: string) {
+  const typed = prompt(`刪除菜單「${name}」？歷史紀錄會保留（menu_id 清空），但菜單本身會消失。\n\n請輸入菜單名稱以確認刪除：`)
+  if (typed === null) return
+  if (typed.trim() !== name) { errorMsg.value = '名稱不符，已取消刪除'; return }
   try {
     const r = await fetch(`/api/admin/fitness/menus/${id}`, { method: 'DELETE', credentials: 'include' })
     if (!r.ok) throw new Error(`HTTP ${r.status}`)
     menus.value = menus.value.filter(m => m.id !== id)
     if (menuDetail.value?.menu.id === id) menuDetail.value = null
+    okMsg.value = `✓ 已刪除「${name}」，歷史紀錄保留`
   } catch (e: any) { errorMsg.value = e?.message || '刪除失敗' }
 }
 
@@ -652,11 +655,36 @@ const Chart = defineComponent({
     onPointClick: { type: Function as any, default: null },
   },
   setup(props: any) {
-    const W = 720
-    const H = 240
-    const pad = { l: 48, r: 24, t: 22, b: 36 }
+    // RWD：用 ResizeObserver 追容器寬，viewBox 跟著實際寬同步，文字字體就維持實際 px 大小
+    const wrapper = ref<HTMLElement | null>(null)
+    const containerW = ref(720)
+    let ro: ResizeObserver | null = null
+
+    onMounted(() => {
+      if (!wrapper.value) return
+      ro = new ResizeObserver(entries => {
+        for (const e of entries) {
+          if (e.contentRect.width > 0) {
+            containerW.value = Math.max(280, Math.floor(e.contentRect.width))
+          }
+        }
+      })
+      ro.observe(wrapper.value)
+    })
+    onUnmounted(() => { ro?.disconnect() })
 
     const dims = computed(() => {
+      const W = containerW.value
+      const isMobile = W < 480
+      const H = Math.min(Math.max(W * (isMobile ? 0.7 : 0.4), 200), 280)
+      const pad = isMobile
+        ? { l: 38, r: 14, t: 22, b: 30 }
+        : { l: 48, r: 24, t: 22, b: 36 }
+      return { W, H, pad, isMobile }
+    })
+
+    const plot = computed(() => {
+      const { W, H, pad } = dims.value
       const all = props.data.series.flatMap((s: any) => s.points)
       if (!all.length) return null
       const days = Array.from(new Set(all.map((p: any) => p.day))).sort() as string[]
@@ -681,71 +709,76 @@ const Chart = defineComponent({
     }
 
     return () => {
-      const d = dims.value
-      if (!d) return h('div', { class: 'chart-empty' }, '無資料')
+      const { W, H, pad, isMobile } = dims.value
+      const fs = isMobile ? 12 : 11        // 文字大小 (viewBox 同 1:1 px)
+      const fsLabel = isMobile ? 13 : 11
+      const ptR = isMobile ? 5 : 4         // 資料點半徑 (手機放大方便點)
+      const p = plot.value
+
+      // wrapper div 用來給 ResizeObserver 量寬度
+      if (!p) {
+        return h('div', {
+          ref: wrapper, class: 'chart-wrapper',
+        }, [h('div', { class: 'chart-empty' }, '無資料')])
+      }
 
       // 軸線 (y left, x bottom)
       const axes: any[] = [
-        // y 軸
         h('line', {
           x1: pad.l, y1: pad.t, x2: pad.l, y2: H - pad.b,
           stroke: 'rgba(255,255,255,.22)', 'stroke-width': 1,
         }),
-        // x 軸
         h('line', {
           x1: pad.l, y1: H - pad.b, x2: W - pad.r, y2: H - pad.b,
           stroke: 'rgba(255,255,255,.22)', 'stroke-width': 1,
         }),
-        // y 軸標籤 "kg" (左上)
         h('text', {
           x: pad.l - 4, y: pad.t - 8, 'text-anchor': 'end',
-          fill: 'rgba(255,255,255,.65)', 'font-size': 11, 'font-weight': 600,
+          fill: 'rgba(255,255,255,.7)', 'font-size': fsLabel, 'font-weight': 600,
         }, 'kg'),
-        // x 軸標籤 "日期" (右下)
         h('text', {
           x: W - pad.r, y: H - 6, 'text-anchor': 'end',
-          fill: 'rgba(255,255,255,.65)', 'font-size': 11, 'font-weight': 600,
+          fill: 'rgba(255,255,255,.7)', 'font-size': fsLabel, 'font-weight': 600,
         }, '日期'),
       ]
 
-      // y 刻度 + grid lines
+      // y 刻度
       const yTicks: any[] = []
-      const ySteps = 4
+      const ySteps = isMobile ? 3 : 4
       for (let i = 0; i <= ySteps; i++) {
-        const v = d.yMin + (d.yMax - d.yMin) * (i / ySteps)
-        const y = d.yOf(v)
+        const v = p.yMin + (p.yMax - p.yMin) * (i / ySteps)
+        const y = p.yOf(v)
         yTicks.push(h('g', { key: 'yt' + i }, [
           h('line', {
             x1: pad.l, x2: W - pad.r, y1: y, y2: y,
             stroke: 'rgba(255,255,255,.05)', 'stroke-dasharray': '2 4',
           }),
-          // tick mark on axis
           h('line', {
             x1: pad.l - 4, x2: pad.l, y1: y, y2: y,
             stroke: 'rgba(255,255,255,.45)', 'stroke-width': 1,
           }),
           h('text', {
-            x: pad.l - 8, y: y + 4, 'text-anchor': 'end',
-            fill: 'rgba(255,255,255,.55)', 'font-size': 11,
+            x: pad.l - 6, y: y + 4, 'text-anchor': 'end',
+            fill: 'rgba(255,255,255,.6)', 'font-size': fs,
           }, v.toFixed(0)),
         ]))
       }
 
       // x 刻度
       const xTicks: any[] = []
-      const showEvery = Math.max(1, Math.ceil(d.days.length / 6))
-      d.days.forEach((day: string, i: number) => {
-        if (i % showEvery !== 0 && i !== d.days.length - 1) return
-        const x = d.xOf(day)
+      const maxXTicks = isMobile ? 4 : 6
+      const showEvery = Math.max(1, Math.ceil(p.days.length / maxXTicks))
+      p.days.forEach((day: string, i: number) => {
+        if (i % showEvery !== 0 && i !== p.days.length - 1) return
+        const x = p.xOf(day)
         xTicks.push(h('g', { key: 'xt' + i }, [
-          // tick mark on axis
           h('line', {
             x1: x, x2: x, y1: H - pad.b, y2: H - pad.b + 4,
             stroke: 'rgba(255,255,255,.45)', 'stroke-width': 1,
           }),
           h('text', {
-            x, y: H - pad.b + 18, 'text-anchor': 'middle',
-            fill: 'rgba(255,255,255,.55)', 'font-size': 11,
+            x, y: H - pad.b + 16, 'text-anchor': 'middle',
+            fill: 'rgba(255,255,255,.6)', 'font-size': fs,
           }, day.slice(5)),
         ]))
       })
@@ -755,27 +788,33 @@ const Chart = defineComponent({
       const points: any[] = []
       for (const s of props.data.series) {
         const sorted = [...s.points].sort((a: any, b: any) => a.day.localeCompare(b.day))
-        const pathD = sorted.map((p: any, i: number) =>
-          `${i === 0 ? 'M' : 'L'} ${d.xOf(p.day).toFixed(1)} ${d.yOf(p.value).toFixed(1)}`,
+        const pathD = sorted.map((pt: any, i: number) =>
+          `${i === 0 ? 'M' : 'L'} ${p.xOf(pt.day).toFixed(1)} ${p.yOf(pt.value).toFixed(1)}`,
         ).join(' ')
         const c = lineColor(s.username)
         lines.push(h('path', {
           d: pathD, fill: 'none', stroke: c,
           'stroke-width': 2, 'stroke-linecap': 'round',
         }))
-        for (const p of sorted) {
+        for (const pt of sorted) {
           points.push(h('circle', {
-            cx: d.xOf(p.day), cy: d.yOf(p.value), r: 4,
+            cx: p.xOf(pt.day), cy: p.yOf(pt.value), r: ptR,
             fill: c, stroke: '#0d0d0d', 'stroke-width': 1.5,
             style: 'cursor: pointer',
-            onClick: () => props.onPointClick?.(p.day, s.userId, s.username),
-          }, [h('title', null, `${s.username} · ${p.day} · ${p.value} kg (點看 ${s.username} 當天詳細)`)]))
+            onClick: () => props.onPointClick?.(pt.day, s.userId, s.username),
+          }, [h('title', null, `${s.username} · ${pt.day} · ${pt.value} kg (點看 ${s.username} 當天詳細)`)]))
         }
       }
 
-      return h('svg', {
-        width: W, height: H, class: 'chart-svg', viewBox: `0 0 ${W} ${H}`,
-      }, [...yTicks, ...xTicks, ...axes, ...lines, ...points])
+      return h('div', {
+        ref: wrapper, class: 'chart-wrapper',
+      }, [
+        h('svg', {
+          width: '100%', height: H, class: 'chart-svg',
+          viewBox: `0 0 ${W} ${H}`,
+          preserveAspectRatio: 'xMidYMid meet',
+        }, [...yTicks, ...xTicks, ...axes, ...lines, ...points]),
+      ])
     }
   },
 })
@@ -837,7 +876,7 @@ onMounted(async () => {
             <div class="menu-actions">
               <button class="btn-ghost" @click="openMenu(m.id)">查看</button>
               <button class="btn-primary" @click="startLog(m.id)">▶ 開始紀錄</button>
-              <button v-if="isAdmin" class="btn-ghost danger small" @click="deleteMenu(m.id)">刪除</button>
+              <button v-if="isAdmin" class="btn-ghost danger small" @click="deleteMenu(m.id, m.name)">刪除</button>
             </div>
           </div>
 
@@ -1242,7 +1281,13 @@ onMounted(async () => {
 
 /* page */
 .page { display: flex; flex-direction: column; gap: 16px; }
-.head { display: flex; justify-content: space-between; align-items: flex-end; }
+.head { 
+  display: flex; 
+  justify-content: space-between; 
+  align-items: flex-end; 
+  flex-wrap: wrap; /* 新增：允許內容換行 */
+  gap: 16px;       /* 新增：換行時的垂直間距 */
+}
 .kicker { font-size: 10.5px; letter-spacing: .26em; color: var(--tx-3); margin: 0; font-weight: 500; }
 .head h2 { font-size: 24px; font-weight: 500; margin-top: 6px; letter-spacing: -0.01em; }
 
@@ -1406,6 +1451,12 @@ onMounted(async () => {
   .log-right {
     position: sticky;
     top: 16px;
+  }
+  .head-actions {
+    width: auto;      /* 桌機不強制佔滿 100% */
+  }
+  .ex-select {
+    min-width: 200px; /* 桌機螢幕夠寬，恢復 200px */
   }
 }
 
@@ -1722,7 +1773,13 @@ onMounted(async () => {
 .round-actions { display: flex; gap: 8px; margin-top: 4px; }
 
 /* dashboard 下拉 */
-.head-actions { display: flex; gap: 10px; align-items: center; }
+.head-actions { 
+  display: flex; 
+  gap: 10px; 
+  align-items: center; 
+  flex-wrap: wrap; /* 新增：允許按鈕與選單換行 */
+  width: 100%;     /* 新增：手機版時佔滿整列 */
+}
 .ex-select {
   background: var(--bg-input);
   border: 1px solid var(--line-2);
@@ -1730,7 +1787,8 @@ onMounted(async () => {
   padding: 8px 12px;
   border-radius: var(--r-sm);
   font-size: 13px;
-  min-width: 200px;
+  flex: 1;           /* 新增：讓選單平均分配寬度 */
+  min-width: 130px;  /* 修改：縮小最小寬度限制 */
   cursor: pointer;
   font-family: inherit;
 }
