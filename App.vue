@@ -973,17 +973,6 @@ onMounted(async () => {
           </li>
         </ul>
 
-        <!-- 備註 — 自動存 (失焦時 PATCH)，「完成訓練」後會出現在留言板 -->
-        <label class="notes-field">
-          <span class="notes-label">📝 備註 (整次訓練)</span>
-          <textarea
-            v-model="logNotes"
-            rows="2"
-            placeholder="今天感受、配重、注意事項…完成後會出現在「留言板」"
-            @blur="saveNotes"
-          />
-        </label>
-
         <!-- 動作完成 / 訓練完成 按鈕 -->
         <div class="log-actions">
           <button v-if="hasNextPosition" class="btn-primary" @click="nextPosition">
@@ -995,6 +984,17 @@ onMounted(async () => {
           <button class="btn-ghost danger small" @click="cancelLog">放棄</button>
         </div>
         </div> <!-- /log-left -->
+
+        <!-- 備註 — 自動存 (失焦時 PATCH)，「完成訓練」後會出現在留言板 -->
+        <label v-if="!hasNextPosition" class="notes-field">
+          <span class="notes-label">📝 備註 (整次訓練)</span>
+          <textarea
+            v-model="logNotes"
+            rows="2"
+            placeholder="今天感受、配重、注意事項…完成後會出現在「留言板」"
+            @blur="saveNotes"
+          />
+        </label>
 
         <!-- 數字鍵盤 -->
         <div class="log-right">
