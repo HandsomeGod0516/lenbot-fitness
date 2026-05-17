@@ -119,6 +119,9 @@ const activeLaneIdx = ref(0)                            // group 內哪一個 la
 const activeField = ref<'weight' | 'reps'>('weight')    // keypad 寫到哪個 tile
 const inputW = ref('')                                  // weight 輸入緩衝
 const inputR = ref('')                                  // reps 輸入緩衝
+// 下一次按數字時要先清空當前欄位
+// (點 tile / 切欄位 / 剛 confirm 完，準備重新輸入而不是接著敲)
+const replaceOnNextDigit = ref(false)
 const logNotes = ref('')                                // 整次訓練備註
 
 const currentGroup = computed(() => {
@@ -370,15 +373,24 @@ async function resumeInProgress(): Promise<boolean> {
 }
 
 // ---- keypad ----
-function setActiveField(f: 'weight' | 'reps') { activeField.value = f }
+function setActiveField(f: 'weight' | 'reps') {
+  activeField.value = f
+  replaceOnNextDigit.value = true       // 點 tile = 準備重新輸入
+}
 function selectLane(idx: number) {
   activeLaneIdx.value = idx
   activeField.value = 'weight'
   inputW.value = ''
   inputR.value = ''
+  replaceOnNextDigit.value = false
 }
 
 function pressDigit(d: string) {
+  if (replaceOnNextDigit.value) {
+    if (activeField.value === 'weight') inputW.value = ''
+    else inputR.value = ''
+    replaceOnNextDigit.value = false
+  }
   if (activeField.value === 'weight') {
     if (inputW.value === '0') inputW.value = d
     else if (inputW.value.length < 6) inputW.value += d
@@ -389,15 +401,21 @@ function pressDigit(d: string) {
 }
 function pressDot() {
   if (activeField.value !== 'weight') return
+  if (replaceOnNextDigit.value) {
+    inputW.value = ''
+    replaceOnNextDigit.value = false
+  }
   if (!inputW.value.includes('.')) inputW.value = (inputW.value || '0') + '.'
 }
 function pressBackspace() {
+  replaceOnNextDigit.value = false      // 開始修改 = 不再 replace
   if (activeField.value === 'weight') inputW.value = inputW.value.slice(0, -1)
   else inputR.value = inputR.value.slice(0, -1)
 }
 function pressClear() {
   if (activeField.value === 'weight') inputW.value = ''
   else inputR.value = ''
+  replaceOnNextDigit.value = false
 }
 
 async function pressConfirm() {
@@ -431,9 +449,11 @@ async function pressConfirm() {
       weightKg: d.weightKg,
       reps: d.reps,
     })
-    // 下一組常用同樣重量，所以只清 reps 並 focus
+    // 下一組常用同樣重量 → 重量留著、reps 清空並 focus 過去；
+    // 但若使用者直接想換重量，再按數字會把留著的重量也清掉。
     inputR.value = ''
     activeField.value = 'reps'
+    replaceOnNextDigit.value = true
   } catch (e: any) { errorMsg.value = e?.message || '存檔失敗' }
 }
 
@@ -820,14 +840,47 @@ const Chart = defineComponent({
 })
 
 // =========================================================================
+// 鍵盤操作 — 在 log tab + 正在記錄時生效
+//   0-9       → pressDigit
+//   .         → pressDot (只對 weight)
+//   Backspace → pressBackspace
+//   Enter     → pressConfirm (送出)
+//   Esc / c   → pressClear
+//   w / r     → 切換 weight / reps
+// =========================================================================
+function onGlobalKeydown(e: KeyboardEvent) {
+  if (tab.value !== 'log' || !logId.value || !currentLane.value) return
+  // 焦點在 input / textarea (例如備註) 時讓原生輸入生效
+  const t = e.target as HTMLElement | null
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+  // 帶任何修飾鍵 (Cmd/Ctrl/Alt/Meta) 一概放行，不要攔截快捷鍵
+  if (e.metaKey || e.ctrlKey || e.altKey) return
+
+  const k = e.key
+  if (/^[0-9]$/.test(k)) { e.preventDefault(); pressDigit(k); return }
+  if (k === '.')         { e.preventDefault(); pressDot();    return }
+  if (k === 'Backspace') { e.preventDefault(); pressBackspace(); return }
+  if (k === 'Enter')     { e.preventDefault(); pressConfirm(); return }
+  if (k === 'Escape' || k.toLowerCase() === 'c') {
+    e.preventDefault(); pressClear(); return
+  }
+  if (k.toLowerCase() === 'w') { e.preventDefault(); setActiveField('weight'); return }
+  if (k.toLowerCase() === 'r') { e.preventDefault(); setActiveField('reps');   return }
+}
+
+// =========================================================================
 // boot
 // =========================================================================
 onMounted(async () => {
+  window.addEventListener('keydown', onGlobalKeydown)
   await fetchMe()
   await loadMenus()
   // 進來自動接上未完成的訓練
   const resumed = await resumeInProgress()
   if (resumed) tab.value = 'log'
+})
+onUnmounted(() => {
+  window.removeEventListener('keydown', onGlobalKeydown)
 })
 </script>
 
