@@ -2070,7 +2070,7 @@ onUnmounted(() => {
   width: 100%;
   max-width: 720px;
   max-height: 90vh;
-  background: var(--bg-1);
+  background: var(--bg-elev);
   border: 1px solid var(--line-2);
   border-radius: var(--r-md);
   display: flex; flex-direction: column;
