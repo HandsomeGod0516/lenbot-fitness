@@ -449,9 +449,8 @@ async function pressConfirm() {
       weightKg: d.weightKg,
       reps: d.reps,
     })
-    // 下一組常用同樣重量 → 重量留著、reps 清空並 focus 過去；
-    // 但若使用者直接想換重量，再按數字會把留著的重量也清掉。
-    inputR.value = ''
+    // 送出後保留重量與 reps 數值，讓使用者連續記錄同樣的組數時可直接再按送出；
+    // 想修改任一欄位時，按下第一個數字會自動取代舊值。
     activeField.value = 'reps'
     replaceOnNextDigit.value = true
   } catch (e: any) { errorMsg.value = e?.message || '存檔失敗' }
