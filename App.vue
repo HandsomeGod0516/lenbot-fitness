@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, defineComponent, h } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, defineComponent, h } from 'vue'
 
 // =========================================================================
 // types
@@ -530,9 +530,39 @@ async function cancelLog() {
 }
 
 // ---- stats ----
-// 下拉選單：動作 + 使用者，'__ALL__' 都是顯示全部 (預設都顯示)
+// 下拉選單：菜單 + 動作 + 使用者 + 時間範圍 + 指標 + 排序 + 最低資料點
+// '__ALL__' 都是顯示全部 (預設都顯示)
 const selectedExercise = ref<string>('__ALL__')
 const selectedUser = ref<string>('__ALL__')
+const selectedMenu = ref<string>('__ALL__')
+type TimeRange = 'all' | '7' | '30' | '90'
+type MetricType = 'max_weight' | 'total_volume'
+type SortMode = 'name' | 'recent' | 'volume'
+const selectedTimeRange = ref<TimeRange>('all')
+const selectedMetric = ref<MetricType>('max_weight')
+const selectedSort = ref<SortMode>('name')
+const minDataPoints = ref<number>(1)
+
+// 菜單 → 該菜單包含的動作名稱 (用 Set，用於過濾 charts)
+const menuExerciseNames = ref<Map<number, Set<string>>>(new Map())
+async function ensureMenuExercises(menuId: number) {
+  if (menuExerciseNames.value.has(menuId)) return
+  try {
+    const r = await fetch(`/api/fitness/menus/${menuId}`, { credentials: 'include' })
+    if (!r.ok) return
+    const d = await r.json() as MenuDetail
+    const names = new Set<string>()
+    for (const g of d.groups) for (const ex of g.exercises) names.add(ex.name)
+    menuExerciseNames.value.set(menuId, names)
+    // 觸發 reactivity (Map.set 不會自動觸發)
+    menuExerciseNames.value = new Map(menuExerciseNames.value)
+  } catch { /* ignore */ }
+}
+watch(selectedMenu, (v) => {
+  if (v !== '__ALL__') ensureMenuExercises(Number(v))
+})
+const metricLabel = computed(() => selectedMetric.value === 'max_weight' ? 'kg' : 'vol')
+const metricCaption = computed(() => selectedMetric.value === 'max_weight' ? '最大重量' : '訓練總量')
 
 async function loadStats() {
   loading.value = true
@@ -550,11 +580,25 @@ async function loadStats() {
 // 把 stats 按 exercise 分組，每個 exercise 內按 user 分組
 interface ChartUserSeries { userId: number; username: string; points: { day: string; value: number }[] }
 interface ChartData { exerciseName: string; series: ChartUserSeries[] }
+
+// 時間範圍 → 起始 day 字串 (YYYY-MM-DD)，'all' 不過濾
+function timeRangeStart(range: TimeRange): string | null {
+  if (range === 'all') return null
+  const days = Number(range)
+  const d = new Date()
+  d.setDate(d.getDate() - days + 1)
+  return d.toISOString().slice(0, 10)
+}
+
 const chartsByExercise = computed<ChartData[]>(() => {
+  const start = timeRangeStart(selectedTimeRange.value)
   const byEx = new Map<string, Map<number, ChartUserSeries>>()
   for (const r of stats.value) {
-    const w = r.max_weight ? Number(r.max_weight) : null
-    if (w === null || isNaN(w)) continue
+    if (start && r.day < start) continue
+    const v = selectedMetric.value === 'max_weight'
+      ? (r.max_weight ? Number(r.max_weight) : null)
+      : (r.total_volume ? Number(r.total_volume) : null)
+    if (v === null || isNaN(v)) continue
     let users = byEx.get(r.exercise_name)
     if (!users) { users = new Map(); byEx.set(r.exercise_name, users) }
     let series = users.get(r.user_id)
@@ -562,7 +606,7 @@ const chartsByExercise = computed<ChartData[]>(() => {
       series = { userId: r.user_id, username: r.display_name || r.username, points: [] }
       users.set(r.user_id, series)
     }
-    series.points.push({ day: r.day, value: w })
+    series.points.push({ day: r.day, value: v })
   }
   const out: ChartData[] = []
   for (const [name, users] of byEx) {
@@ -582,8 +626,27 @@ const allUsers = computed(() => {
   return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name))
 })
 
+// 每張 chart 的「最新日期」與「總資料點數」(給排序 / 過濾用)
+function chartLastDay(c: ChartData): string {
+  let last = ''
+  for (const s of c.series) {
+    for (const p of s.points) if (p.day > last) last = p.day
+  }
+  return last
+}
+function chartPointCount(c: ChartData): number {
+  let n = 0
+  for (const s of c.series) n += s.points.length
+  return n
+}
+
 const visibleCharts = computed(() => {
   let list = chartsByExercise.value
+  if (selectedMenu.value !== '__ALL__') {
+    const names = menuExerciseNames.value.get(Number(selectedMenu.value))
+    if (names) list = list.filter(c => names.has(c.exerciseName))
+    else list = []   // 菜單動作清單還沒載入完，先空白
+  }
   if (selectedExercise.value !== '__ALL__') {
     list = list.filter(c => c.exerciseName === selectedExercise.value)
   }
@@ -593,6 +656,22 @@ const visibleCharts = computed(() => {
       .map(c => ({ exerciseName: c.exerciseName, series: c.series.filter(s => s.userId === uid) }))
       .filter(c => c.series.length > 0)
   }
+  // 最少資料點 (依 chart 內所有 series 總點數)
+  const min = minDataPoints.value
+  if (min > 1) {
+    list = list.filter(c => chartPointCount(c) >= min)
+  }
+  // 排序
+  const sortMode = selectedSort.value
+  list = [...list].sort((a, b) => {
+    if (sortMode === 'recent') {
+      return chartLastDay(b).localeCompare(chartLastDay(a))
+    }
+    if (sortMode === 'volume') {
+      return chartPointCount(b) - chartPointCount(a)
+    }
+    return a.exerciseName.localeCompare(b.exerciseName)
+  })
   return list
 })
 
@@ -672,6 +751,7 @@ const Chart = defineComponent({
   props: {
     data: { type: Object as any, required: true },
     onPointClick: { type: Function as any, default: null },
+    yLabel: { type: String, default: 'kg' },
   },
   setup(props: any) {
     // RWD：用 ResizeObserver 追容器寬，viewBox 跟著實際寬同步，文字字體就維持實際 px 大小
@@ -754,7 +834,7 @@ const Chart = defineComponent({
         h('text', {
           x: pad.l - 4, y: pad.t - 8, 'text-anchor': 'end',
           fill: 'rgba(255,255,255,.7)', 'font-size': fsLabel, 'font-weight': 600,
-        }, 'kg'),
+        }, props.yLabel),
         h('text', {
           x: W - pad.r, y: H - 6, 'text-anchor': 'end',
           fill: 'rgba(255,255,255,.7)', 'font-size': fsLabel, 'font-weight': 600,
@@ -1101,37 +1181,89 @@ onUnmounted(() => {
           <h2>大家的成長曲線</h2>
         </div>
         <div class="head-actions">
-          <select v-model="selectedExercise" class="ex-select" :disabled="!chartsByExercise.length">
-            <option value="__ALL__">所有動作 ({{ chartsByExercise.length }})</option>
-            <option
-              v-for="c in chartsByExercise"
-              :key="c.exerciseName"
-              :value="c.exerciseName"
-            >{{ c.exerciseName }}</option>
-          </select>
-          <select v-model="selectedUser" class="ex-select" :disabled="!allUsers.length">
-            <option value="__ALL__">所有使用者 ({{ allUsers.length }})</option>
-            <option
-              v-for="u in allUsers"
-              :key="u.id"
-              :value="String(u.id)"
-            >{{ u.name }}</option>
-          </select>
+          <label class="filter-field">
+            <span class="filter-label">菜單</span>
+            <select v-model="selectedMenu" class="ex-select" :disabled="!menus.length">
+              <option value="__ALL__">所有菜單 ({{ menus.length }})</option>
+              <option
+                v-for="m in menus"
+                :key="m.id"
+                :value="String(m.id)"
+              >{{ m.name }}</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            <span class="filter-label">動作</span>
+            <select v-model="selectedExercise" class="ex-select" :disabled="!chartsByExercise.length">
+              <option value="__ALL__">所有動作 ({{ chartsByExercise.length }})</option>
+              <option
+                v-for="c in chartsByExercise"
+                :key="c.exerciseName"
+                :value="c.exerciseName"
+              >{{ c.exerciseName }}</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            <span class="filter-label">使用者</span>
+            <select v-model="selectedUser" class="ex-select" :disabled="!allUsers.length">
+              <option value="__ALL__">所有使用者 ({{ allUsers.length }})</option>
+              <option
+                v-for="u in allUsers"
+                :key="u.id"
+                :value="String(u.id)"
+              >{{ u.name }}</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            <span class="filter-label">時間範圍</span>
+            <select v-model="selectedTimeRange" class="ex-select">
+              <option value="all">全部</option>
+              <option value="7">最近 7 天</option>
+              <option value="30">最近 30 天</option>
+              <option value="90">最近 90 天</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            <span class="filter-label">指標</span>
+            <select v-model="selectedMetric" class="ex-select">
+              <option value="max_weight">最大重量 (kg)</option>
+              <option value="total_volume">訓練總量 (vol)</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            <span class="filter-label">排序</span>
+            <select v-model="selectedSort" class="ex-select">
+              <option value="name">名稱</option>
+              <option value="recent">最近活動</option>
+              <option value="volume">最多資料點</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            <span class="filter-label">最少資料點</span>
+            <select v-model.number="minDataPoints" class="ex-select">
+              <option :value="1">不限</option>
+              <option :value="3">≥ 3</option>
+              <option :value="5">≥ 5</option>
+              <option :value="10">≥ 10</option>
+            </select>
+          </label>
           <button class="btn-ghost" @click="loadStats">↻ 重新載入</button>
         </div>
       </header>
 
       <div v-if="loading && !chartsByExercise.length" class="muted">LOADING…</div>
       <div v-else-if="!chartsByExercise.length" class="empty">還沒有任何紀錄。先去記一次！</div>
+      <div v-else-if="!visibleCharts.length" class="empty">目前篩選條件下沒有資料，試著放寬條件。</div>
 
       <div v-else class="charts">
         <article v-for="c in visibleCharts" :key="c.exerciseName" class="chart-card">
           <header class="chart-head">
             <h3>{{ c.exerciseName }}</h3>
-            <p class="muted">點任一資料點看當天所有人的詳細 sets</p>
+            <p class="muted">{{ metricCaption }} · 點任一資料點看當天所有人的詳細 sets</p>
           </header>
           <Chart
             :data="c"
+            :y-label="metricLabel"
             :on-point-click="(day: string, uid: number, uname: string) => openDayDetail(c.exerciseName, day, uid, uname)"
           />
           <ul class="legend">
@@ -1843,9 +1975,28 @@ onUnmounted(() => {
   min-width: 130px;  /* 修改：縮小最小寬度限制 */
   cursor: pointer;
   font-family: inherit;
+  width: 100%;
 }
 .ex-select:focus { border-color: var(--tx-2); outline: none; }
 .ex-select:disabled { opacity: .5; cursor: not-allowed; }
+
+/* 每個下拉欄位包一層 label，讓上方標籤清楚 */
+.filter-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1 1 150px;
+  min-width: 130px;
+}
+.filter-label {
+  font-size: 10px;
+  letter-spacing: .14em;
+  color: var(--tx-3);
+  text-transform: uppercase;
+}
+@media (min-width: 768px) {
+  .filter-field { flex: 0 0 auto; min-width: 150px; }
+}
 
 .btn-primary.lg { padding: 13px 24px; font-size: 13.5px; align-self: flex-start; }
 .btn-ghost.small { padding: 4px 10px; font-size: 11.5px; }
