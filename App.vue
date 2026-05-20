@@ -1602,8 +1602,7 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  max-width: 1100px;
-  margin: 0 auto;
+  width: 100%;
 }
 
 /* 主體 = ex-head + set-list + log-actions (左) + keypad (右) */
@@ -1644,12 +1643,63 @@ onUnmounted(() => {
   }
 }
 
-/* 手機：set list 可以縮窄 */
+/* 手機：set list 可以縮窄、整體更緊湊 */
 @media (max-width: 767px) {
-  .log-page { max-width: 540px; }
-  .tile { height: 64px; }
-  .tile-val { font-size: 26px; }
-  .key { height: 52px; font-size: 20px; }
+  /* .log-page 鎖定為視窗高度，內部用 flex 控制 (扣掉 portal-main 手機版 topbar ~47px
+     + container 上下 padding 10+16=26 + tabs+gap ~50 ≈ 130) */
+  .log-page {
+    max-width: 540px;
+    align-self: center;
+    gap: 10px;
+    height: calc(100dvh - 130px);
+    min-height: 0;
+  }
+  .log-body {
+    flex: 1;
+    min-height: 0;
+  }
+  .log-left {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .log-right {
+    flex: 0 0 auto;
+  }
+
+  /* 外層 gap 收緊 */
+  .fit { gap: 10px; }
+
+  /* tabs 變小 */
+  .tab { padding: 7px 12px; font-size: 11.5px; gap: 6px; }
+  .tab-glyph { font-size: 13px; }
+
+  /* POSITION nav 收緊 */
+  .pos-nav { padding: 6px 12px; gap: 8px; }
+  .ico-btn { width: 36px; height: 36px; font-size: 18px; }
+  .pos-num { font-size: 16px; }
+
+  /* 動作 header 收緊 */
+  .ex-head { padding: 10px 14px; }
+  .ex-title { font-size: 15px; }
+  .vol-num { font-size: 22px; }
+
+  /* 紀錄頁主體間距 */
+  .log-body { gap: 10px; }
+  .log-left, .log-right { gap: 10px; }
+
+  /* 動作完成按鈕 */
+  .log-actions .btn-primary { padding: 10px; font-size: 12px; }
+
+  /* set list 空狀態 */
+  .empty-li { padding: 8px 12px; font-size: 11px; }
+
+  /* tiles + keypad 收緊 */
+  .tile { height: 56px; }
+  .tile-val { font-size: 22px; }
+  .tiles { gap: 6px; }
+  .key { height: 44px; font-size: 18px; }
+  .keypad { gap: 4px; }
 }
 
 .pos-nav {
