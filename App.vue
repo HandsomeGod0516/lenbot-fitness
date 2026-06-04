@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch, defineComponent, h } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick, defineComponent, h } from 'vue'
 
 // =========================================================================
 // types
@@ -122,7 +122,20 @@ const inputR = ref('')                                  // reps 輸入緩衝
 // 下一次按數字時要先清空當前欄位
 // (點 tile / 切欄位 / 剛 confirm 完，準備重新輸入而不是接著敲)
 const replaceOnNextDigit = ref(false)
-const logNotes = ref('')                                // 整次訓練備註
+const logNotes = ref('')                                // 整次訓練備註 (resume 用，DB 拉回來的暫存)
+
+// 完成訓練 modal — 點「完成訓練」時跳出，讓使用者補備註 + 日期
+const showFinishModal = ref(false)
+const finishNotes = ref('')
+const finishDate = ref('')   // YYYY-MM-DD
+
+function todayYMD(): string {
+  const d = new Date()
+  const yyyy = d.getFullYear()
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  return `${yyyy}-${mm}-${dd}`
+}
 
 const currentGroup = computed(() => {
   return logMenuLoaded.value?.groups.find(g => g.position === currentPosition.value) || null
@@ -373,9 +386,19 @@ async function resumeInProgress(): Promise<boolean> {
 }
 
 // ---- keypad ----
+// 已紀錄 sets 的捲動容器 (手機版會出現滾輪) → 用來自動捲到最底
+const setListRef = ref<HTMLElement | null>(null)
+function scrollSetsToBottom() {
+  nextTick(() => {
+    const el = setListRef.value
+    if (el) el.scrollTop = el.scrollHeight
+  })
+}
+
 function setActiveField(f: 'weight' | 'reps') {
   activeField.value = f
   replaceOnNextDigit.value = true       // 點 tile = 準備重新輸入
+  if (f === 'weight') scrollSetsToBottom()   // 開始輸入重量時，把最近的組捲到看得見
 }
 function selectLane(idx: number) {
   activeLaneIdx.value = idx
@@ -453,6 +476,7 @@ async function pressConfirm() {
     // 想修改任一欄位時，按下第一個數字會自動取代舊值。
     activeField.value = 'reps'
     replaceOnNextDigit.value = true
+    scrollSetsToBottom()                 // 新增一組後捲到最底，讓最新組可見
   } catch (e: any) { errorMsg.value = e?.message || '存檔失敗' }
 }
 
@@ -479,10 +503,6 @@ async function patchLog(payload: any) {
   })
 }
 
-async function saveNotes() {
-  if (!logId.value) return
-  await patchLog({ notes: logNotes.value })
-}
 async function nextPosition() {
   if (!hasNextPosition.value) return
   const newPos = positions.value[currentPositionIdx.value + 1]
@@ -498,14 +518,30 @@ async function prevPosition() {
   selectLane(0)
 }
 
-async function finishLog() {
+// 點「完成訓練」改成跳 modal：讓使用者補備註 + 補填日期 (default 今天)
+function openFinishModal() {
   if (!logId.value) return
-  if (!confirm('完成這次訓練？完成後不能再加組。')) return
+  finishNotes.value = logNotes.value || ''
+  finishDate.value = todayYMD()
+  showFinishModal.value = true
+}
+
+async function confirmFinish() {
+  if (!logId.value) return
+  errorMsg.value = ''
   try {
-    await fetch(`/api/fitness/logs/${logId.value}/finish`, {
-      method: 'POST', credentials: 'include',
+    const r = await fetch(`/api/fitness/logs/${logId.value}/finish`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({
+        notes: finishNotes.value.trim() || null,    // 空字串視為沒填
+        performedAt: finishDate.value || null,
+      }),
     })
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
     okMsg.value = '✓ 訓練已完成'
+    showFinishModal.value = false
     logId.value = null
     logMenuLoaded.value = null
     logSets.value = []
@@ -530,18 +566,22 @@ async function cancelLog() {
 }
 
 // ---- stats ----
-// 下拉選單：菜單 + 動作 + 使用者 + 時間範圍 + 指標 + 排序 + 最低資料點
+// 下拉選單：菜單 + 動作 + 使用者 + 日期區間 + 指標 + 排序
 // '__ALL__' 都是顯示全部 (預設都顯示)
 const selectedExercise = ref<string>('__ALL__')
 const selectedUser = ref<string>('__ALL__')
 const selectedMenu = ref<string>('__ALL__')
-type TimeRange = 'all' | '7' | '30' | '90'
 type MetricType = 'max_weight' | 'total_volume'
 type SortMode = 'name' | 'recent' | 'volume'
-const selectedTimeRange = ref<TimeRange>('all')
+const dateFrom = ref<string>('')   // YYYY-MM-DD，空字串 = 不限起日
+const dateTo = ref<string>('')     // YYYY-MM-DD，空字串 = 不限迄日
 const selectedMetric = ref<MetricType>('max_weight')
 const selectedSort = ref<SortMode>('name')
-const minDataPoints = ref<number>(1)
+
+function clearDateRange() {
+  dateFrom.value = ''
+  dateTo.value = ''
+}
 
 // 菜單 → 該菜單包含的動作名稱 (用 Set，用於過濾 charts)
 const menuExerciseNames = ref<Map<number, Set<string>>>(new Map())
@@ -581,20 +621,13 @@ async function loadStats() {
 interface ChartUserSeries { userId: number; username: string; points: { day: string; value: number }[] }
 interface ChartData { exerciseName: string; series: ChartUserSeries[] }
 
-// 時間範圍 → 起始 day 字串 (YYYY-MM-DD)，'all' 不過濾
-function timeRangeStart(range: TimeRange): string | null {
-  if (range === 'all') return null
-  const days = Number(range)
-  const d = new Date()
-  d.setDate(d.getDate() - days + 1)
-  return d.toISOString().slice(0, 10)
-}
-
 const chartsByExercise = computed<ChartData[]>(() => {
-  const start = timeRangeStart(selectedTimeRange.value)
+  const from = dateFrom.value || null
+  const to = dateTo.value || null
   const byEx = new Map<string, Map<number, ChartUserSeries>>()
   for (const r of stats.value) {
-    if (start && r.day < start) continue
+    if (from && r.day < from) continue
+    if (to && r.day > to) continue
     const v = selectedMetric.value === 'max_weight'
       ? (r.max_weight ? Number(r.max_weight) : null)
       : (r.total_volume ? Number(r.total_volume) : null)
@@ -655,11 +688,6 @@ const visibleCharts = computed(() => {
     list = list
       .map(c => ({ exerciseName: c.exerciseName, series: c.series.filter(s => s.userId === uid) }))
       .filter(c => c.series.length > 0)
-  }
-  // 最少資料點 (依 chart 內所有 series 總點數)
-  const min = minDataPoints.value
-  if (min > 1) {
-    list = list.filter(c => chartPointCount(c) >= min)
   }
   // 排序
   const sortMode = selectedSort.value
@@ -1044,12 +1072,20 @@ onUnmounted(() => {
       </template>
 
       <template v-else>
-        <!-- POSITION navigation -->
+        <!-- POSITION navigation (compact) -->
         <header class="pos-nav">
           <button class="ico-btn" :disabled="!hasPrevPosition" @click="prevPosition">‹</button>
           <div class="pos-label">
-            <span class="kicker">POSITION</span>
+            <p class="ex-sub">
+              <span v-if="setsForCurrentLane.length">{{ setsForCurrentLane.length }} 組</span>
+              <span v-else>尚未紀錄</span>
+              <span v-if="currentLane?.target_sets || currentLane?.target_reps" class="ex-target">
+                · 建議 {{ currentLane.target_sets || '?' }} × {{ currentLane.target_reps || '?' }}
+              </span>
+            </p>
             <span class="pos-num">{{ currentPositionIdx + 1 }} / {{ positionsCount }}</span>
+            <p class="vol-num">{{ totalVolumeForLane.toFixed(0) }}</p>
+            <p class="vol-unit">kg total</p>
           </div>
           <button class="ico-btn" :disabled="!hasNextPosition" @click="nextPosition">›</button>
         </header>
@@ -1068,25 +1104,7 @@ onUnmounted(() => {
         </div>
 
         <div class="log-body">
-        <div class="log-left">
-        <!-- 目前動作 header -->
-        <div class="ex-head">
-          <div>
-            <p class="ex-title">{{ currentLane?.name }}</p>
-            <p class="ex-sub">
-              <span v-if="setsForCurrentLane.length">{{ setsForCurrentLane.length }} 組</span>
-              <span v-else>尚未紀錄</span>
-              <span v-if="currentLane?.target_sets || currentLane?.target_reps" class="ex-target">
-                · 建議 {{ currentLane.target_sets || '?' }} × {{ currentLane.target_reps || '?' }}
-              </span>
-            </p>
-          </div>
-          <div class="ex-vol">
-            <p class="vol-num">{{ totalVolumeForLane.toFixed(0) }}</p>
-            <p class="vol-unit">kg total</p>
-          </div>
-        </div>
-
+        <div class="log-left" ref="setListRef">
         <!-- 已紀錄的 sets -->
         <ul class="set-list">
           <li v-for="s in setsForCurrentLane" :key="s.id" class="set-li">
@@ -1104,32 +1122,16 @@ onUnmounted(() => {
             這個動作還沒紀錄任何組
           </li>
         </ul>
-
-        <!-- 動作完成 / 訓練完成 按鈕 -->
-        <div class="log-actions">
-          <button v-if="hasNextPosition" class="btn-primary" @click="nextPosition">
-            下一個 POSITION →
-          </button>
-          <button v-else class="btn-primary" @click="finishLog">
-            ✓ 完成訓練
-          </button>
-          <button class="btn-ghost danger small" @click="cancelLog">放棄</button>
-        </div>
         </div> <!-- /log-left -->
-
-        <!-- 備註 — 自動存 (失焦時 PATCH)，「完成訓練」後會出現在留言板 -->
-        <label v-if="!hasNextPosition" class="notes-field">
-          <span class="notes-label">📝 備註 (整次訓練)</span>
-          <textarea
-            v-model="logNotes"
-            rows="2"
-            placeholder="今天感受、配重、注意事項…完成後會出現在「留言板」"
-            @blur="saveNotes"
-          />
-        </label>
 
         <!-- 數字鍵盤 -->
         <div class="log-right">
+        <!-- 訓練完成按鈕 (跳 modal 補備註 + 日期) -->
+        <div class="log-actions">
+          <button class="btn-primary" @click="openFinishModal">
+            ✓ 完成訓練
+          </button>
+        </div>
         <div class="keypad-section">
           <div class="tiles">
             <button
@@ -1166,6 +1168,7 @@ onUnmounted(() => {
 
             <button class="key dot" @click="pressDot">.</button>
             <button class="key zero" @click="pressDigit('0')">0</button>
+            <button class="key cancel" @click="cancelLog" title="放棄這次訓練">放棄</button>
           </div>
         </div>
         </div> <!-- /log-right -->
@@ -1214,15 +1217,26 @@ onUnmounted(() => {
               >{{ u.name }}</option>
             </select>
           </label>
-          <label class="filter-field">
-            <span class="filter-label">時間範圍</span>
-            <select v-model="selectedTimeRange" class="ex-select">
-              <option value="all">全部</option>
-              <option value="7">最近 7 天</option>
-              <option value="30">最近 30 天</option>
-              <option value="90">最近 90 天</option>
-            </select>
-          </label>
+          <div class="filter-field date-range-field">
+            <span class="filter-label">日期區間</span>
+            <div class="date-range">
+              <input
+                v-model="dateFrom"
+                type="date"
+                class="ex-select date-input"
+                :max="dateTo || undefined"
+                aria-label="起日"
+              />
+              <span class="date-sep">–</span>
+              <input
+                v-model="dateTo"
+                type="date"
+                class="ex-select date-input"
+                :min="dateFrom || undefined"
+                aria-label="迄日"
+              />
+            </div>
+          </div>
           <label class="filter-field">
             <span class="filter-label">指標</span>
             <select v-model="selectedMetric" class="ex-select">
@@ -1238,15 +1252,12 @@ onUnmounted(() => {
               <option value="volume">最多資料點</option>
             </select>
           </label>
-          <label class="filter-field">
-            <span class="filter-label">最少資料點</span>
-            <select v-model.number="minDataPoints" class="ex-select">
-              <option :value="1">不限</option>
-              <option :value="3">≥ 3</option>
-              <option :value="5">≥ 5</option>
-              <option :value="10">≥ 10</option>
-            </select>
-          </label>
+          <button
+            v-if="dateFrom || dateTo"
+            class="btn-ghost small"
+            @click="clearDateRange"
+            title="清除日期區間"
+          >× 清除日期</button>
           <button class="btn-ghost" @click="loadStats">↻ 重新載入</button>
         </div>
       </header>
@@ -1378,6 +1389,38 @@ onUnmounted(() => {
       </ul>
     </section>
 
+    <!-- ==================== Finish modal (完成訓練 → 補備註 + 日期) ==================== -->
+    <div v-if="showFinishModal" class="overlay" @click.self="showFinishModal = false">
+      <div class="finish-modal">
+        <header class="finish-head">
+          <div>
+            <p class="kicker">FINISH</p>
+            <h3>完成訓練</h3>
+          </div>
+          <button class="ico" @click="showFinishModal = false">×</button>
+        </header>
+        <div class="finish-body">
+          <label class="field">
+            <span>訓練日期</span>
+            <input v-model="finishDate" type="date" class="finish-date" />
+            <small class="hint">忘記填寫的可以改成當天日期補填</small>
+          </label>
+          <label class="field">
+            <span>備註 (選填)</span>
+            <textarea
+              v-model="finishNotes"
+              rows="4"
+              placeholder="今天感受、配重、注意事項… 留空就不會出現在留言板"
+            />
+          </label>
+        </div>
+        <footer class="finish-foot">
+          <button class="btn-ghost" @click="showFinishModal = false">取消</button>
+          <button class="btn-primary" @click="confirmFinish">✓ 確認完成</button>
+        </footer>
+      </div>
+    </div>
+
     <!-- ==================== Builder modal ==================== -->
     <div v-if="showBuilder" class="overlay" @click.self="showBuilder = false">
       <div class="builder">
@@ -1433,7 +1476,9 @@ onUnmounted(() => {
 
 
 <style scoped>
-.fit { display: flex; flex-direction: column; gap: 18px; }
+/* touch-action: manipulation → 停掉手機「快速點兩下放大」(double-tap zoom)，
+   仍保留正常捲動與雙指縮放 */
+.fit { display: flex; flex-direction: column; gap: 18px; touch-action: manipulation; }
 
 /* tabs */
 .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -1675,9 +1720,10 @@ onUnmounted(() => {
   .tab-glyph { font-size: 13px; }
 
   /* POSITION nav 收緊 */
-  .pos-nav { padding: 6px 12px; gap: 8px; }
-  .ico-btn { width: 36px; height: 36px; font-size: 18px; }
-  .pos-num { font-size: 16px; }
+  .pos-nav { padding: 4px 10px; gap: 8px; grid-template-columns: 30px 1fr 30px; }
+  .ico-btn { width: 28px; height: 28px; font-size: 14px; }
+  .pos-num { font-size: 12px; }
+  .pos-label .kicker { font-size: 9px; }
 
   /* 動作 header 收緊 */
   .ex-head { padding: 10px 14px; }
@@ -1691,46 +1737,58 @@ onUnmounted(() => {
   /* 動作完成按鈕 */
   .log-actions .btn-primary { padding: 10px; font-size: 12px; }
 
-  /* set list 空狀態 */
+  /* set list — 手機更緊湊，一次看到更多組 */
+  .set-list { gap: 2px; }
+  .set-li { padding: 3px 8px; grid-template-columns: 20px 1fr 24px; gap: 7px; }
+  .set-li-num { width: 20px; height: 20px; font-size: 10px; border-radius: 5px; }
+  .set-li-body .num { font-size: 16px; }
+  .set-li-body .lbl { font-size: 9px; }
+  .set-li-body .x { font-size: 12px; margin: 0 3px; }
+  .trash { width: 24px; height: 24px; font-size: 11px; }
   .empty-li { padding: 8px 12px; font-size: 11px; }
 
   /* tiles + keypad 收緊 */
-  .tile { height: 56px; }
-  .tile-val { font-size: 22px; }
-  .tiles { gap: 6px; }
-  .key { height: 44px; font-size: 18px; }
+  .keypad-section { gap: 5px; margin-top: 2px; }
+  .tile { height: 40px; }
+  .tile-val { font-size: 18px; }
+  .tile-unit { font-size: 8px; margin-top: 1px; }
+  .tiles { gap: 5px; }
+  .key { height: 32px; font-size: 15px; }
+  .key.cancel { font-size: 11px; }
   .keypad { gap: 4px; }
 }
 
 .pos-nav {
   display: grid;
-  grid-template-columns: 48px 1fr 48px;
+  grid-template-columns: 34px 1fr 34px;
   align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
+  gap: 10px;
+  padding: 6px 12px;
   background: var(--bg-tile);
   border: 1px solid var(--line-2);
   border-radius: var(--r-md);
 }
 .ico-btn {
-  width: 44px; height: 44px;
+  width: 30px; height: 30px;
   border-radius: var(--r-sm);
   background: var(--bg-input);
   border: 1px solid var(--line-2);
   color: var(--tx-1);
-  font-size: 22px;
+  font-size: 16px;
   cursor: pointer;
   transition: background .12s, color .12s;
+  display: grid; place-items: center;
 }
 .ico-btn:hover:not(:disabled) { background: var(--hover-bg); }
 .ico-btn:disabled { opacity: .25; cursor: not-allowed; }
-.pos-label { text-align: center; }
-.pos-label .kicker { display: block; font-size: 10px; }
+.pos-label {
+  display: flex; align-items: baseline; justify-content: center; gap: 8px;
+}
+.pos-label .kicker { font-size: 9.5px; letter-spacing: .22em; }
 .pos-num {
-  font-size: 18px;
+  font-size: 13px;
   font-weight: 600;
   font-family: 'JetBrains Mono', ui-monospace, monospace;
-  margin-top: 2px;
 }
 
 /* lane tabs (superset) */
@@ -1792,47 +1850,48 @@ onUnmounted(() => {
 }
 .vol-unit { font-size: 10px; color: var(--tx-3); margin-top: 4px; letter-spacing: .14em; }
 
-/* 已紀錄 sets list */
+/* 已紀錄 sets list — 數字放大讓使用者一眼就看到組數 */
 .set-list {
   list-style: none;
   padding: 0;
   margin: 0;
   display: flex; flex-direction: column;
-  gap: 6px;
+  gap: 3px;
 }
 .set-li {
   display: grid;
-  grid-template-columns: 44px 1fr 44px;
-  gap: 10px;
+  grid-template-columns: 24px 1fr 26px;
+  gap: 8px;
   align-items: center;
-  padding: 8px 12px;
+  padding: 4px 10px;
   background: var(--bg-tile);
   border: 1px solid var(--line-2);
   border-radius: var(--r-sm);
 }
 .set-li-num {
-  width: 32px; height: 32px;
+  width: 24px; height: 24px;
   display: grid; place-items: center;
   background: var(--bg-input);
   border-radius: 6px;
   font-family: 'JetBrains Mono', ui-monospace, monospace;
-  font-size: 13px;
-  color: var(--tx-2);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--tx-1);
 }
 .set-li-body {
   display: flex; align-items: baseline; gap: 6px;
   font-family: 'JetBrains Mono', ui-monospace, monospace;
 }
-.set-li-body .num { font-size: 17px; color: var(--tx-1); font-weight: 500; }
+.set-li-body .num { font-size: 18px; color: var(--tx-1); font-weight: 600; line-height: 1; }
 .set-li-body .lbl { font-size: 10px; color: var(--tx-3); letter-spacing: .1em; }
-.set-li-body .x { color: var(--tx-3); margin: 0 4px; }
+.set-li-body .x { color: var(--tx-3); margin: 0 4px; font-size: 14px; }
 .trash {
-  width: 34px; height: 34px;
+  width: 26px; height: 26px;
   border-radius: 6px;
   background: transparent;
   border: 1px solid var(--line-2);
   color: var(--tx-3);
-  font-size: 14px;
+  font-size: 13px;
   cursor: pointer;
   transition: color .12s, background .12s;
 }
@@ -1841,7 +1900,7 @@ onUnmounted(() => {
   grid-template-columns: 1fr;
   color: var(--tx-3); font-size: 12.5px;
   text-align: center;
-  padding: 14px 12px;
+  padding: 12px;
   border-style: dashed;
 }
 
@@ -1885,23 +1944,24 @@ onUnmounted(() => {
 
 /* 數字鍵盤區 */
 .keypad-section {
-  margin-top: 6px;
+  margin-top: 4px;
   display: flex; flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 .tiles {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 8px;
+  gap: 6px;
 }
 .tile {
   position: relative;
-  height: 70px;
+  height: 46px;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   background: var(--bg-tile);
   border: 2px solid var(--line-2);
   border-radius: var(--r-md);
   cursor: pointer;
+  touch-action: manipulation;   /* 連點不放大 */
   transition: border-color .12s, background .12s;
   padding: 4px 8px;
 }
@@ -1910,48 +1970,58 @@ onUnmounted(() => {
   background: rgba(255,255,255,.05);
 }
 .tile-val {
-  font-size: 30px; font-weight: 500;
+  font-size: 21px; font-weight: 500;
   color: var(--tx-1);
   font-family: 'JetBrains Mono', ui-monospace, monospace;
   line-height: 1;
 }
 .tile-unit {
-  font-size: 11px; color: var(--tx-3);
-  margin-top: 4px;
+  font-size: 9px; color: var(--tx-3);
+  margin-top: 2px;
   letter-spacing: .14em;
 }
 
 .keypad {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 6px;
+  gap: 5px;
 }
 .key {
-  height: 56px;
+  height: 36px;
   background: var(--bg-tile);
   color: var(--tx-1);
   border: 1px solid var(--line-2);
   border-radius: var(--r-sm);
-  font-size: 22px;
+  font-size: 18px;
   font-weight: 500;
   font-family: 'JetBrains Mono', ui-monospace, monospace;
   cursor: pointer;
+  touch-action: manipulation;   /* 連點不放大 */
   transition: background .12s, transform .05s;
 }
 .key:hover { background: var(--hover-bg); }
 .key:active { transform: scale(.96); }
-.key.fn { font-size: 18px; color: var(--tx-2); }
-.key.dot { grid-column: span 1; font-size: 26px; }
-.key.zero { grid-column: span 2; font-size: 22px; }
+.key.fn { font-size: 16px; color: var(--tx-2); }
+.key.dot { grid-column: span 1; font-size: 22px; }
+.key.zero { grid-column: span 2; font-size: 18px; }
 .key.confirm {
   background: var(--tx-1);
   color: #000;
-  font-size: 22px;
+  font-size: 18px;
   font-weight: 700;
   border-color: var(--tx-1);
   grid-row: span 1;
 }
 .key.confirm:hover { opacity: .9; }
+.key.cancel {
+  background: rgba(255,77,79,.08);
+  color: var(--danger);
+  border-color: rgba(255,77,79,.30);
+  font-size: 13px;
+  font-family: inherit;
+  letter-spacing: .04em;
+}
+.key.cancel:hover { background: rgba(255,77,79,.16); }
 
 /* superset 交錯排列 (legacy CSS — 已不用於 log tab，但保留給將來) */
 .superset-hint {
@@ -2029,6 +2099,34 @@ onUnmounted(() => {
 }
 .ex-select:focus { border-color: var(--tx-2); outline: none; }
 .ex-select:disabled { opacity: .5; cursor: not-allowed; }
+.date-input {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  color-scheme: dark;        /* 讓原生日歷 picker 用暗色主題 */
+  min-width: 0;              /* 允許在 flex 容器內縮小，避免擠到別的欄位 */
+}
+
+/* 日期區間：兩個 date input 共用一格欄位 */
+.date-range-field { flex: 1 1 260px; min-width: 220px; }
+.date-range {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.date-range .date-input {
+  flex: 1 1 0;
+  width: 100%;
+  padding: 8px 8px;
+  font-size: 12px;
+}
+.date-sep {
+  color: var(--tx-3);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 14px;
+  flex: 0 0 auto;
+}
+@media (min-width: 768px) {
+  .date-range-field { flex: 0 0 auto; min-width: 260px; }
+}
 
 /* 每個下拉欄位包一層 label，讓上方標籤清楚 */
 .filter-field {
@@ -2330,6 +2428,61 @@ onUnmounted(() => {
   text-align: center;
 }
 .builder-foot {
+  display: flex; justify-content: flex-end; gap: 10px;
+  padding: 14px 22px;
+  border-top: 1px solid var(--line-2);
+  background: rgba(0,0,0,.25);
+}
+
+/* ==================== Finish modal ==================== */
+.finish-modal {
+  width: 100%;
+  max-width: 460px;
+  background: var(--bg-elev);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.finish-head {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  padding: 16px 22px;
+  border-bottom: 1px solid var(--line-2);
+}
+.finish-head h3 { font-size: 18px; font-weight: 500; margin-top: 4px; }
+.finish-head .ico { font-size: 22px; }
+.finish-body {
+  padding: 18px 22px;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.finish-body .field span {
+  display: block; font-size: 10.5px; color: var(--tx-3);
+  letter-spacing: .14em; margin-bottom: 6px; text-transform: uppercase;
+}
+.finish-body .field input,
+.finish-body .field textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line-2);
+  background: var(--bg-input);
+  color: var(--tx-1);
+  border-radius: var(--r-sm);
+  outline: none;
+  font: inherit;
+  font-size: 14px;
+  resize: vertical;
+  transition: border-color .15s;
+}
+.finish-body .field input:focus,
+.finish-body .field textarea:focus { border-color: var(--tx-2); }
+.finish-date { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+.finish-body .hint {
+  display: block;
+  font-size: 11px;
+  color: var(--tx-3);
+  margin-top: 6px;
+}
+.finish-foot {
   display: flex; justify-content: flex-end; gap: 10px;
   padding: 14px 22px;
   border-top: 1px solid var(--line-2);
