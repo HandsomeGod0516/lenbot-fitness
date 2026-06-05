@@ -1077,10 +1077,10 @@ onUnmounted(() => {
           <button class="ico-btn" :disabled="!hasPrevPosition" @click="prevPosition">‹</button>
           <div class="pos-label">
             <p class="ex-sub">
+              <span v-if="currentGroup.exercises.length == 1">{{currentGroup.exercises[0].name}}</span>
               <span v-if="setsForCurrentLane.length">{{ setsForCurrentLane.length }} 組</span>
-              <span v-else>尚未紀錄</span>
               <span v-if="currentLane?.target_sets || currentLane?.target_reps" class="ex-target">
-                · 建議 {{ currentLane.target_sets || '?' }} × {{ currentLane.target_reps || '?' }}
+                建議 {{ currentLane.target_sets || '?' }} × {{ currentLane.target_reps || '?' }}
               </span>
             </p>
             <span class="pos-num">{{ currentPositionIdx + 1 }} / {{ positionsCount }}</span>
