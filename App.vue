@@ -2268,7 +2268,11 @@ onUnmounted(() => {
   font-family: 'JetBrains Mono', ui-monospace, monospace;
   color-scheme: dark;        /* 讓原生日歷 picker 用暗色主題 */
   min-width: 0;              /* 允許在 flex 容器內縮小，避免擠到別的欄位 */
+  -webkit-appearance: none;  /* iOS：重置原生 date 外觀，避免值置中跑版 */
+  appearance: none;
+  text-align: left;
 }
+.date-input::-webkit-date-and-time-value { text-align: left; }
 
 /* 日期區間：兩個 date input 共用一格欄位 */
 .date-range-field { flex: 1 1 260px; min-width: 220px; }
@@ -2640,7 +2644,17 @@ onUnmounted(() => {
 }
 .finish-body .field input:focus,
 .finish-body .field textarea:focus { border-color: var(--tx-2); }
-.finish-date { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+.finish-date {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  /* iOS 原生 date input 預設會把值置中/塌高度，看起來像跑出框。
+     重置 appearance + 靠左 + 固定觸控高度，讓它跟一般輸入框一致。 */
+  -webkit-appearance: none;
+  appearance: none;
+  text-align: left;
+  min-height: 44px;
+}
+/* iOS 會把 date 的值塞進一個置中的 inner span，這裡強制靠左 */
+.finish-date::-webkit-date-and-time-value { text-align: left; }
 .finish-body .hint {
   display: block;
   font-size: 11px;
