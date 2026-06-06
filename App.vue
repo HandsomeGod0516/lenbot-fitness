@@ -458,6 +458,9 @@ async function resumeInProgress(): Promise<boolean> {
     logId.value = d.log.id
     currentPosition.value = d.log.current_position || 1
     logNotes.value = d.log.notes || ''
+    // 先清掉舊菜單；菜單若已被刪除 (menu_id = NULL 或抓不到) 就維持 null，
+    // 由 log tab 顯示「無法繼續」並提供放棄/完成的出口。
+    logMenuLoaded.value = null
     if (d.log.menu_id) {
       const mr = await fetch(`/api/fitness/menus/${d.log.menu_id}`, { credentials: 'include' })
       if (mr.ok) logMenuLoaded.value = await mr.json()
@@ -1185,8 +1188,22 @@ onUnmounted(() => {
         請先到「菜單」tab 選一份菜單，按「▶ 開始紀錄」進來。
       </div>
 
-      <template v-else-if="!currentGroup">
-        <div class="empty">菜單沒有 POSITION 資料。</div>
+      <template v-else-if="!logMenuLoaded || !currentGroup">
+        <div class="orphan-log">
+          <p class="orphan-title">⚠ 這次訓練無法繼續</p>
+          <p class="muted">
+            {{ !logMenuLoaded
+              ? '這次訓練使用的菜單已被刪除，找不到動作內容。'
+              : '這份菜單沒有任何動作資料。' }}
+          </p>
+          <p v-if="logSets.length" class="muted">
+            已經記錄 {{ logSets.length }} 組，可以「完成並保存」留到歷史紀錄，或直接放棄。
+          </p>
+          <div class="orphan-actions">
+            <button v-if="logSets.length" class="btn-primary" @click="openFinishModal">✓ 完成並保存</button>
+            <button class="btn-ghost danger" @click="cancelLog">🗑 放棄這次訓練</button>
+          </div>
+        </div>
       </template>
 
       <template v-else>
@@ -1658,6 +1675,17 @@ onUnmounted(() => {
   border-radius: var(--r-md);
   color: var(--tx-3);
 }
+
+/* 孤兒訓練 (菜單已被刪除) 的提示 + 出口 */
+.orphan-log {
+  text-align: center; padding: 48px 24px;
+  background: var(--bg-tile);
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-md);
+  display: flex; flex-direction: column; gap: 12px; align-items: center;
+}
+.orphan-title { font-size: 16px; font-weight: 600; color: var(--danger); }
+.orphan-actions { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; margin-top: 8px; }
 
 /* menu list */
 .menu-filters {

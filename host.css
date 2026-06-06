@@ -48,3 +48,10 @@ body {
 }
 button, input, textarea, select { font-family: inherit; font-size: inherit; }
 button { cursor: pointer; background: none; border: 0; color: inherit; }
+
+/* iOS Safari：欄位字體 < 16px 時，focus 會自動放大整個畫面。
+   手機尺寸下把所有輸入欄位統一拉到 16px 關掉這行為。
+   只影響手機，桌機字體不變、雙指縮放也保留。 */
+@media (max-width: 640px) {
+  input, select, textarea { font-size: 16px !important; }
+}
