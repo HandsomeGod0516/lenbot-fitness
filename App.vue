@@ -93,11 +93,51 @@ interface Draft {
   exercises: DraftExercise[]
 }
 const showBuilder = ref(false)
+const editingMenuId = ref<number | null>(null)   // null = 新增；有值 = 編輯該菜單
+const builderTitle = computed(() => editingMenuId.value ? '編輯菜單' : '新增菜單')
 const draft = ref<Draft>({
   name: '',
   description: '',
   exercises: [{ name: '', position: 1, slot: 1, target_sets: '', target_reps: '', notes: '' }],
 })
+
+// 過往所有設定過的動作名稱 (給動作名稱欄位搜尋下拉)
+const exerciseNames = ref<string[]>([])
+async function loadExerciseNames() {
+  try {
+    const r = await fetch('/api/fitness/exercise-names', { credentials: 'include' })
+    if (!r.ok) return
+    const d = await r.json()
+    exerciseNames.value = d.names || []
+  } catch { /* ignore */ }
+}
+
+// 菜單列表的搜尋 / 篩選
+const menuSearch = ref('')                 // 名稱 / 描述關鍵字
+const menuCreatorFilter = ref('__ALL__')   // 建立者 id (string) 或 __ALL__
+const menuCreators = computed(() => {
+  const map = new Map<number, string>()
+  for (const m of menus.value) map.set(m.created_by, m.created_by_username)
+  return Array.from(map, ([id, username]) => ({ id, username }))
+    .sort((a, b) => a.username.localeCompare(b.username))
+})
+const filteredMenus = computed(() => {
+  const kw = menuSearch.value.trim().toLowerCase()
+  const creator = menuCreatorFilter.value
+  return menus.value.filter((m) => {
+    if (creator !== '__ALL__' && String(m.created_by) !== creator) return false
+    if (kw) {
+      const hay = `${m.name} ${m.description || ''} ${m.created_by_username}`.toLowerCase()
+      if (!hay.includes(kw)) return false
+    }
+    return true
+  })
+})
+
+// 能不能編輯/刪除這份菜單：本人或 admin
+function canManage(m: MenuSummary): boolean {
+  return !!me.value && (me.value.id === m.created_by || me.value.role === 'admin')
+}
 
 // =========================================================================
 // 紀錄狀態 (新版：逐 set 存檔、resume in-progress)
@@ -245,8 +285,11 @@ async function deleteMenu(id: number, name: string) {
   if (typed === null) return
   if (typed.trim() !== name) { errorMsg.value = '名稱不符，已取消刪除'; return }
   try {
-    const r = await fetch(`/api/admin/fitness/menus/${id}`, { method: 'DELETE', credentials: 'include' })
-    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    const r = await fetch(`/api/fitness/menus/${id}`, { method: 'DELETE', credentials: 'include' })
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}))
+      throw new Error(err?.statusMessage || `HTTP ${r.status}`)
+    }
     menus.value = menus.value.filter(m => m.id !== id)
     if (menuDetail.value?.menu.id === id) menuDetail.value = null
     okMsg.value = `✓ 已刪除「${name}」，歷史紀錄保留`
@@ -282,11 +325,51 @@ function removeExercise(idx: number) {
   draft.value.exercises.splice(idx, 1)
 }
 function resetDraft() {
+  editingMenuId.value = null
   draft.value = {
     name: '', description: '',
     exercises: [{ name: '', position: 1, slot: 1, target_sets: '', target_reps: '', notes: '' }],
   }
 }
+
+/** 開新增菜單 */
+function openBuilder() {
+  resetDraft()
+  showBuilder.value = true
+}
+
+/** 開編輯菜單：抓菜單詳細灌進 draft */
+async function openEditMenu(m: MenuSummary) {
+  errorMsg.value = ''
+  okMsg.value = ''
+  try {
+    const r = await fetch(`/api/fitness/menus/${m.id}`, { credentials: 'include' })
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    const detail = await r.json() as MenuDetail
+    const exs: DraftExercise[] = []
+    for (const g of detail.groups) {
+      for (const ex of g.exercises) {
+        exs.push({
+          name: ex.name,
+          position: g.position,
+          slot: ex.slot,
+          target_sets: ex.target_sets != null ? String(ex.target_sets) : '',
+          target_reps: ex.target_reps != null ? String(ex.target_reps) : '',
+          notes: ex.notes || '',
+        })
+      }
+    }
+    if (!exs.length) exs.push({ name: '', position: 1, slot: 1, target_sets: '', target_reps: '', notes: '' })
+    draft.value = {
+      name: detail.menu.name,
+      description: detail.menu.description || '',
+      exercises: exs,
+    }
+    editingMenuId.value = m.id
+    showBuilder.value = true
+  } catch (e: any) { errorMsg.value = e?.message || '載入失敗' }
+}
+
 async function saveMenu() {
   errorMsg.value = ''
   okMsg.value = ''
@@ -302,25 +385,35 @@ async function saveMenu() {
       notes: e.notes || null,
     }))
   if (!exs.length) { errorMsg.value = '至少要一個動作'; return }
+  const isEdit = editingMenuId.value !== null
   try {
-    const r = await fetch('/api/admin/fitness/menus', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({
-        name: draft.value.name.trim(),
-        description: draft.value.description.trim() || null,
-        exercises: exs,
-      }),
-    })
+    const r = await fetch(
+      isEdit ? `/api/fitness/menus/${editingMenuId.value}` : '/api/fitness/menus',
+      {
+        method: isEdit ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          name: draft.value.name.trim(),
+          description: draft.value.description.trim() || null,
+          exercises: exs,
+        }),
+      },
+    )
     if (!r.ok) {
       const err = await r.json().catch(() => ({}))
       throw new Error(err?.statusMessage || `HTTP ${r.status}`)
     }
-    okMsg.value = '✓ 菜單已建立'
+    okMsg.value = isEdit ? '✓ 菜單已更新' : '✓ 菜單已建立'
     showBuilder.value = false
+    const editedId = editingMenuId.value
     resetDraft()
     await loadMenus()
+    await loadExerciseNames()           // 動作清單可能有新名稱
+    // 編輯中若正在看該菜單詳情，重新整理
+    if (isEdit && editedId && menuDetail.value?.menu.id === editedId) {
+      await openMenu(editedId)
+    }
   } catch (e: any) { errorMsg.value = e?.message || '儲存失敗' }
 }
 
@@ -982,6 +1075,7 @@ onMounted(async () => {
   window.addEventListener('keydown', onGlobalKeydown)
   await fetchMe()
   await loadMenus()
+  await loadExerciseNames()
   // 進來自動接上未完成的訓練
   const resumed = await resumeInProgress()
   if (resumed) tab.value = 'log'
@@ -1019,14 +1113,37 @@ onUnmounted(() => {
           <p class="kicker">MENUS</p>
           <h2>健身菜單</h2>
         </div>
-        <button v-if="isAdmin" class="btn-primary" @click="showBuilder = true">+ 新增菜單</button>
+        <button class="btn-primary" @click="openBuilder">+ 新增菜單</button>
       </header>
 
+      <!-- 搜尋 / 篩選 -->
+      <div v-if="menus.length" class="menu-filters">
+        <input
+          v-model="menuSearch"
+          type="search"
+          class="ex-select menu-search"
+          placeholder="🔍 搜尋菜單名稱 / 描述 / 建立者"
+        />
+        <label class="filter-field">
+          <span class="filter-label">建立者</span>
+          <select v-model="menuCreatorFilter" class="ex-select">
+            <option value="__ALL__">所有人 ({{ menuCreators.length }})</option>
+            <option v-for="c in menuCreators" :key="c.id" :value="String(c.id)">{{ c.username }}</option>
+          </select>
+        </label>
+        <button
+          v-if="menuSearch || menuCreatorFilter !== '__ALL__'"
+          class="btn-ghost small"
+          @click="() => { menuSearch = ''; menuCreatorFilter = '__ALL__' }"
+        >× 清除</button>
+      </div>
+
       <div v-if="loading && !menus.length" class="muted">LOADING…</div>
-      <div v-else-if="!menus.length" class="empty">尚無菜單<span v-if="isAdmin">，點上方「+ 新增菜單」開始</span></div>
+      <div v-else-if="!menus.length" class="empty">尚無菜單，點上方「+ 新增菜單」開始</div>
+      <div v-else-if="!filteredMenus.length" class="empty">找不到符合條件的菜單，試著放寬搜尋。</div>
 
       <div v-else class="menu-list">
-        <article v-for="m in menus" :key="m.id" class="menu-card">
+        <article v-for="m in filteredMenus" :key="m.id" class="menu-card">
           <div class="menu-head">
             <div>
               <h3>{{ m.name }}</h3>
@@ -1036,7 +1153,8 @@ onUnmounted(() => {
             <div class="menu-actions">
               <button class="btn-ghost" @click="openMenu(m.id)">查看</button>
               <button class="btn-primary" @click="startLog(m.id)">▶ 開始紀錄</button>
-              <button v-if="isAdmin" class="btn-ghost danger small" @click="deleteMenu(m.id, m.name)">刪除</button>
+              <button v-if="canManage(m)" class="btn-ghost small" @click="openEditMenu(m)">編輯</button>
+              <button v-if="canManage(m)" class="btn-ghost danger small" @click="deleteMenu(m.id, m.name)">刪除</button>
             </div>
           </div>
 
@@ -1425,7 +1543,7 @@ onUnmounted(() => {
     <div v-if="showBuilder" class="overlay" @click.self="showBuilder = false">
       <div class="builder">
         <header class="builder-head">
-          <p class="kicker">NEW MENU</p>
+          <p class="kicker">{{ editingMenuId ? 'EDIT MENU' : 'NEW MENU' }} · {{ builderTitle }}</p>
           <button class="ico" @click="showBuilder = false">×</button>
         </header>
 
@@ -1452,7 +1570,13 @@ onUnmounted(() => {
               </p>
               <div v-for="item in g.items" :key="item.idx" class="builder-ex">
                 <span class="ex-tag">{{ g.position }}.{{ item.ex.slot }}</span>
-                <input v-model="item.ex.name" type="text" placeholder="動作名稱 *" class="grow" />
+                <input
+                  v-model="item.ex.name"
+                  type="text"
+                  list="exercise-name-options"
+                  placeholder="動作名稱 * (可搜尋過往動作)"
+                  class="grow"
+                />
                 <input v-model="item.ex.target_sets" type="number" placeholder="組" class="num-input" />
                 <input v-model="item.ex.target_reps" type="number" placeholder="次" class="num-input" />
                 <input v-model="item.ex.notes" type="text" placeholder="備註" class="grow" />
@@ -1463,6 +1587,11 @@ onUnmounted(() => {
           </template>
 
           <button class="btn-ghost" @click="addPosition">+ 加下一個 position (新動作)</button>
+
+          <!-- 過往所有動作名稱：動作名稱欄位的搜尋下拉來源 -->
+          <datalist id="exercise-name-options">
+            <option v-for="n in exerciseNames" :key="n" :value="n" />
+          </datalist>
         </div>
 
         <footer class="builder-foot">
@@ -1531,6 +1660,14 @@ onUnmounted(() => {
 }
 
 /* menu list */
+.menu-filters {
+  display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;
+  margin-bottom: 16px;
+}
+.menu-search {
+  flex: 1 1 240px;
+  min-width: 180px;
+}
 .menu-list { display: flex; flex-direction: column; gap: 12px; }
 .menu-card {
   background: var(--bg-tile);
