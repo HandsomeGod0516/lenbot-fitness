@@ -2626,14 +2626,15 @@ onUnmounted(() => {
   .tab { padding: 7px 12px; font-size: 11.5px; gap: 6px; }
   .tab-glyph { font-size: 13px; }
 
-  /* POSITION nav — 頂部資訊字放大、單位提亮看得清楚 */
-  .pos-nav { padding: 6px 10px; gap: 8px; grid-template-columns: 34px 1fr 34px; }
-  .ico-btn { width: 34px; height: 34px; font-size: 18px; }
-  .pos-num { font-size: 14px; }
-  .ex-sub { font-size: 14px; color: var(--tx-2); }
-  .ex-target { font-size: 13px; }
-  .vol-num { font-size: 25px; }
-  .vol-unit { font-size: 11.5px; color: var(--tx-2); }
+  /* POSITION nav — 切換上下組的箭頭與資訊字放大（有空間，允許換行） */
+  .pos-nav { padding: 10px 10px; gap: 10px; grid-template-columns: 44px 1fr 44px; }
+  .ico-btn { width: 44px; height: 44px; font-size: 24px; }
+  .pos-label { flex-wrap: wrap; row-gap: 3px; }
+  .pos-num { font-size: 17px; }
+  .ex-sub { font-size: 15px; color: var(--tx-2); }
+  .ex-target { font-size: 14px; }
+  .vol-num { font-size: 30px; }
+  .vol-unit { font-size: 13px; color: var(--tx-2); }
 
   /* 動作 header 收緊 */
   .ex-head { padding: 10px 14px; }
@@ -2646,9 +2647,9 @@ onUnmounted(() => {
   /* 動作完成按鈕 */
   .log-actions .btn-primary { padding: 11px; font-size: 14px; }
 
-  /* set list — 數字與單位放大、單位提亮看得清楚 */
-  .set-list { gap: 4px; }
-  .set-li { padding: 7px 10px; grid-template-columns: 26px 1fr 30px; gap: 9px; }
+  /* set list — 數字大、列收緊一點讓更多組看得到（3 欄: 編號 / 內容 / 刪除） */
+  .set-list { gap: 3px; }
+  .set-li { padding: 5px 10px; grid-template-columns: 26px 1fr 30px; gap: 9px; }
   .set-li-num { width: 26px; height: 26px; font-size: 13px; border-radius: 6px; }
   .set-li-body { gap: 7px; }
   .set-li-body .num { font-size: 23px; }
@@ -2658,20 +2659,23 @@ onUnmounted(() => {
   /* empty-li 要重設回單欄：mobile .set-li 的 3 欄 grid 排在更後面會蓋掉 base .empty-li */
   .empty-li { grid-template-columns: 1fr; padding: 10px 12px; font-size: 13px; }
 
-  /* tiles：目前輸入的重量/次數放大 */
-  .keypad-section { gap: 8px; margin-top: 2px; }
-  .tile { height: 54px; padding: 4px 8px; }
-  .tile-val { font-size: 28px; }
-  .tile-unit { font-size: 12px; margin-top: 2px; color: var(--tx-2); }
-  .tiles { gap: 8px; }
+  /* 完成訓練按鈕收緊，把高度讓給清單 */
+  .log-actions .btn-primary { padding: 9px; font-size: 14px; }
 
-  /* 鍵盤：數字放大、padding 收掉，更好按也更好讀 */
-  .key { height: 48px; font-size: 26px; }
-  .key.fn { font-size: 22px; }
-  .key.dot { font-size: 30px; }
-  .key.zero { font-size: 26px; }
-  .key.confirm { font-size: 26px; }
-  .key.cancel { font-size: 16px; }
-  .keypad { gap: 6px; }
+  /* tiles：目前輸入的重量/次數 — 數字大、高度收一點 */
+  .keypad-section { gap: 6px; margin-top: 2px; }
+  .tile { height: 46px; padding: 2px 8px; }
+  .tile-val { font-size: 28px; }
+  .tile-unit { font-size: 12px; margin-top: 1px; color: var(--tx-2); }
+  .tiles { gap: 7px; }
+
+  /* 鍵盤：按鍵變矮、padding 收掉，數字放到最大、填滿按鍵更好讀好按 */
+  .key { height: 42px; font-size: 32px; font-weight: 600; }
+  .key.fn { font-size: 24px; }
+  .key.dot { font-size: 34px; }
+  .key.zero { font-size: 32px; }
+  .key.confirm { font-size: 28px; }
+  .key.cancel { font-size: 17px; }
+  .keypad { gap: 5px; }
 }
 </style>
