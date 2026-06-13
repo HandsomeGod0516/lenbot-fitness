@@ -1853,75 +1853,8 @@ onUnmounted(() => {
   }
 }
 
-/* 手機：set list 可以縮窄、整體更緊湊 */
-@media (max-width: 767px) {
-  /* .log-page 鎖定為視窗高度，內部用 flex 控制 (扣掉 portal-main 手機版 topbar ~47px
-     + container 上下 padding 10+16=26 + tabs+gap ~50 ≈ 130) */
-  .log-page {
-    max-width: 540px;
-    align-self: center;
-    gap: 10px;
-    height: calc(100dvh - 130px);
-    min-height: 0;
-  }
-  .log-body {
-    flex: 1;
-    min-height: 0;
-  }
-  .log-left {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-  }
-  .log-right {
-    flex: 0 0 auto;
-  }
-
-  /* 外層 gap 收緊 */
-  .fit { gap: 10px; }
-
-  /* tabs 變小 */
-  .tab { padding: 7px 12px; font-size: 11.5px; gap: 6px; }
-  .tab-glyph { font-size: 13px; }
-
-  /* POSITION nav 收緊 */
-  .pos-nav { padding: 4px 10px; gap: 8px; grid-template-columns: 30px 1fr 30px; }
-  .ico-btn { width: 28px; height: 28px; font-size: 14px; }
-  .pos-num { font-size: 12px; }
-  .pos-label .kicker { font-size: 9px; }
-
-  /* 動作 header 收緊 */
-  .ex-head { padding: 10px 14px; }
-  .ex-title { font-size: 15px; }
-  .vol-num { font-size: 22px; }
-
-  /* 紀錄頁主體間距 */
-  .log-body { gap: 10px; }
-  .log-left, .log-right { gap: 10px; }
-
-  /* 動作完成按鈕 */
-  .log-actions .btn-primary { padding: 10px; font-size: 12px; }
-
-  /* set list — 手機更緊湊，一次看到更多組 */
-  .set-list { gap: 2px; }
-  .set-li { padding: 3px 8px; grid-template-columns: 20px 1fr 24px; gap: 7px; }
-  .set-li-num { width: 20px; height: 20px; font-size: 10px; border-radius: 5px; }
-  .set-li-body .num { font-size: 16px; }
-  .set-li-body .lbl { font-size: 9px; }
-  .set-li-body .x { font-size: 12px; margin: 0 3px; }
-  .trash { width: 24px; height: 24px; font-size: 11px; }
-  .empty-li { padding: 8px 12px; font-size: 11px; }
-
-  /* tiles + keypad 收緊 */
-  .keypad-section { gap: 5px; margin-top: 2px; }
-  .tile { height: 40px; }
-  .tile-val { font-size: 18px; }
-  .tile-unit { font-size: 8px; margin-top: 1px; }
-  .tiles { gap: 5px; }
-  .key { height: 32px; font-size: 15px; }
-  .key.cancel { font-size: 11px; }
-  .keypad { gap: 4px; }
-}
+/* 手機版 log 畫面的覆寫已移到 <style> 最末端（在所有 base 規則之後），
+   否則同特異度下後面的 base 規則會蓋掉這些手機覆寫。見檔尾 @media (max-width: 767px)。 */
 
 .pos-nav {
   display: grid;
@@ -2666,5 +2599,79 @@ onUnmounted(() => {
   padding: 14px 22px;
   border-top: 1px solid var(--line-2);
   background: rgba(0,0,0,.25);
+}
+
+/* ===========================================================================
+   手機版 log 畫面覆寫 — 必須放在所有 base 規則之後！
+   同特異度下後出現者勝；放前面會被後面的 base (.key/.tile-val/.set-li-body…) 蓋掉。
+   =========================================================================== */
+@media (max-width: 767px) {
+  /* .log-page 鎖定為視窗高度，內部用 flex 控制 (扣掉 portal-main 手機版 topbar ~47px
+     + container 上下 padding 10+16=26 + tabs+gap ~50 ≈ 130) */
+  .log-page {
+    max-width: 540px;
+    align-self: center;
+    gap: 10px;
+    height: calc(100dvh - 130px);
+    min-height: 0;
+  }
+  .log-body { flex: 1; min-height: 0; gap: 10px; }
+  .log-left { flex: 1; min-height: 0; overflow-y: auto; gap: 10px; }
+  .log-right { flex: 0 0 auto; gap: 10px; }
+
+  /* 外層 gap 收緊 */
+  .fit { gap: 10px; }
+
+  /* tabs 變小 */
+  .tab { padding: 7px 12px; font-size: 11.5px; gap: 6px; }
+  .tab-glyph { font-size: 13px; }
+
+  /* POSITION nav — 頂部資訊字放大、單位提亮看得清楚 */
+  .pos-nav { padding: 6px 10px; gap: 8px; grid-template-columns: 34px 1fr 34px; }
+  .ico-btn { width: 34px; height: 34px; font-size: 18px; }
+  .pos-num { font-size: 14px; }
+  .ex-sub { font-size: 14px; color: var(--tx-2); }
+  .ex-target { font-size: 13px; }
+  .vol-num { font-size: 25px; }
+  .vol-unit { font-size: 11.5px; color: var(--tx-2); }
+
+  /* 動作 header 收緊 */
+  .ex-head { padding: 10px 14px; }
+  .ex-title { font-size: 15px; }
+
+  /* 動作分頁 (superset) 放大 */
+  .lane-tab { font-size: 14px; padding: 9px 12px; }
+  .lane-tab .tag { font-size: 11px; }
+
+  /* 動作完成按鈕 */
+  .log-actions .btn-primary { padding: 11px; font-size: 14px; }
+
+  /* set list — 數字與單位放大、單位提亮看得清楚 */
+  .set-list { gap: 4px; }
+  .set-li { padding: 7px 10px; grid-template-columns: 26px 1fr 30px; gap: 9px; }
+  .set-li-num { width: 26px; height: 26px; font-size: 13px; border-radius: 6px; }
+  .set-li-body { gap: 7px; }
+  .set-li-body .num { font-size: 23px; }
+  .set-li-body .lbl { font-size: 13px; color: var(--tx-2); }
+  .set-li-body .x { font-size: 17px; margin: 0 5px; }
+  .trash { width: 30px; height: 30px; font-size: 13px; }
+  /* empty-li 要重設回單欄：mobile .set-li 的 3 欄 grid 排在更後面會蓋掉 base .empty-li */
+  .empty-li { grid-template-columns: 1fr; padding: 10px 12px; font-size: 13px; }
+
+  /* tiles：目前輸入的重量/次數放大 */
+  .keypad-section { gap: 8px; margin-top: 2px; }
+  .tile { height: 54px; padding: 4px 8px; }
+  .tile-val { font-size: 28px; }
+  .tile-unit { font-size: 12px; margin-top: 2px; color: var(--tx-2); }
+  .tiles { gap: 8px; }
+
+  /* 鍵盤：數字放大、padding 收掉，更好按也更好讀 */
+  .key { height: 48px; font-size: 26px; }
+  .key.fn { font-size: 22px; }
+  .key.dot { font-size: 30px; }
+  .key.zero { font-size: 26px; }
+  .key.confirm { font-size: 26px; }
+  .key.cancel { font-size: 16px; }
+  .keypad { gap: 6px; }
 }
 </style>
